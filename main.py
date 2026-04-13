@@ -3,7 +3,6 @@ import math
 import smbus2
 import numpy as np
 from gpiozero import Button, LED, Buzzer
-from signal import pause
 
 class SmartHelmet:
     # I2C Addresses
@@ -17,10 +16,12 @@ class SmartHelmet:
     SOS_HOLD_TIME = 3.0
 
     def __init__(self, bus_num=1):
-        self.bus = smbus2.SMBus(bus_num)
+        self.bus_num = bus_num
+        self.bus = None
+        self.init_bus()
         
         # Initialize gpiozero components
-        # TTP223 is Active-High, so pull_up=False (uses internal pull-down)
+        # TTP223 is Active-High, so pull_up=False
         self.touch_sensor = Button(self.TOUCH_PIN, pull_up=False)
         self.led = LED(self.LED_PIN)
         self.buzzer = Buzzer(self.BUZZER_PIN)
@@ -33,47 +34,67 @@ class SmartHelmet:
         self.is_sos_alarm = False
         self.is_removal_alarm = False
         
-        # Event-driven "I'm Okay" Reset
+        # Event-driven Reset
         self.touch_sensor.when_pressed = self.reset_from_touch
 
+    def init_bus(self):
+        """Initialize or re-initialize the I2C bus."""
+        try:
+            if self.bus:
+                self.bus.close()
+            self.bus = smbus2.SMBus(self.bus_num)
+            print(f"I2C Bus {self.bus_num} initialized.")
+        except Exception as e:
+            print(f"Failed to initialize I2C bus: {e}")
+
     def setup_sensors(self):
-        """Initialize I2C sensors with correct opcodes."""
+        """CRITICAL FIX: BH1750 Reset and MPU6050 Wake-up."""
         try:
             # Wake up MPU6050
             self.bus.write_byte_data(self.MPU_ADDR, 0x6B, 0)
+            print("MPU6050: Power Management register set to 0 (Awake).")
             
-            # Initialize BH1750 (GY-302)
+            # BH1750 Reset Sequence
             self.bus.write_byte(self.BH_ADDR, 0x01) # Power On
-            time.sleep(0.1)
-            # Explicitly set Continuous High-Res Mode (0x10)
-            self.bus.write_byte(self.BH_ADDR, 0x10)
-            time.sleep(0.2) # Allow time for first reading
+            time.sleep(0.05)
+            self.bus.write_byte(self.BH_ADDR, 0x07) # Reset opcode
+            time.sleep(0.05)
+            self.bus.write_byte(self.BH_ADDR, 0x10) # Continuous High-Res Mode
+            print("BH1750: Reset sequence (PowerOn -> Reset -> ContinuousMode) complete.")
+            
+            time.sleep(0.2) # Stabilization delay
         except Exception as e:
-            print(f"Sensor Initialization Error: {e}")
+            print(f"Sensor Setup Error: {e}. Attempting bus re-init...")
+            self.init_bus()
 
     def get_lux(self):
-        """Read continuous lux data from BH1750."""
+        """Read continuous lux data from BH1750 with error handling."""
         try:
-            # Read 2 bytes from continuous high-res mode
             data = self.bus.read_i2c_block_data(self.BH_ADDR, 0x10, 2)
-            return (data[0] << 8 | data[1]) / 1.2
-        except: return 0
+            lux = (data[0] << 8 | data[1]) / 1.2
+            return lux
+        except Exception as e:
+            print(f"\nBH1750 Read Error: {e}")
+            self.setup_sensors() # Try to reset sensors
+            return 0
 
     def get_accel(self):
-        """Read raw acceleration data from MPU6050."""
+        """Read raw acceleration data from MPU6050 with error handling."""
         try:
             d = self.bus.read_i2c_block_data(self.MPU_ADDR, 0x3B, 6)
             def rw(h, l):
                 v = (h << 8) + l
                 return v - 65536 if v >= 0x8000 else v
-            # Scale factor for +/- 2g range is 16384.0
             return rw(d[0], d[1])/16384.0, rw(d[2], d[3])/16384.0, rw(d[4], d[5])/16384.0
-        except: return 0, 0, 0
+        except Exception as e:
+            print(f"\nMPU6050 Read Error: {e}")
+            self.setup_sensors() # Try to reset sensors
+            return 0, 0, 0
 
     def reset_from_touch(self):
-        """Callback for 'I'm Okay' Reset."""
-        if self.is_fall_alarm:
-            print("\n'I'm Okay' Reset triggered via Touch Sensor.")
+        """Callback for Touch Sensor Reset."""
+        if self.is_fall_alarm or self.is_sos_alarm or self.is_removal_alarm:
+            print("\nTOUCH RESET: All alarms cleared.")
             self.reset_alarms()
 
     def reset_alarms(self):
@@ -82,18 +103,15 @@ class SmartHelmet:
         self.buzzer.off()
 
     def update_indicators(self):
-        """Handle alarm patterns based on current state."""
+        """Non-blocking alarm patterns."""
         if self.is_sos_alarm:
-            # High-frequency SOS (fast blink/beep)
             if int(time.time() * 10) % 2:
                 self.led.on(); self.buzzer.on()
             else:
                 self.led.off(); self.buzzer.off()
         elif self.is_fall_alarm:
-            # Solid Alarm
             self.led.on(); self.buzzer.on()
         elif self.is_removal_alarm:
-            # Slower notification pattern
             if int(time.time() * 2) % 2:
                 self.led.on(); self.buzzer.on()
             else:
@@ -101,15 +119,14 @@ class SmartHelmet:
         else:
             self.led.off(); self.buzzer.off()
 
-    def process_loop(self):
+    def run_iteration(self):
+        # 1. Read Sensors
         lux = self.get_lux()
         ax, ay, az = self.get_accel()
         at = math.sqrt(ax**2 + ay**2 + az**2)
+        touch_state = self.touch_sensor.value # 1 if pressed, 0 if not
         
-        # Touch sensor hardware state for SOS hold check
-        is_touched = self.touch_sensor.is_pressed
-        
-        # 1. Helmet Removal Logic
+        # 2. Logic: Removal
         if lux > self.LUX_THRESH:
             if not self.removal_start: self.removal_start = time.time()
             elif time.time() - self.removal_start > self.REMOVAL_DELAY:
@@ -119,56 +136,53 @@ class SmartHelmet:
             if not (self.is_fall_alarm or self.is_sos_alarm): 
                 self.is_removal_alarm = False
 
-        # 2. Manual SOS Hold Logic
-        if is_touched:
-            # Check if this touch has been held long enough for SOS
-            # Note: touch_sensor.active_time is built-in to gpiozero
+        # 3. Logic: SOS Hold
+        if self.touch_sensor.is_pressed:
             if self.touch_sensor.active_time and self.touch_sensor.active_time > self.SOS_HOLD_TIME:
                 if not self.is_sos_alarm:
-                    print("\nMANUAL SOS ACTIVATED!")
+                    print("\nSOS TRIGGERED: Manual Emergency!")
                     self.is_sos_alarm = True
-        
-        # 3. Fall Detection logic
+
+        # 4. Logic: Fall Detection
         if at < self.FREEFALL_THRESH and not self.is_fall_alarm:
             time.sleep(0.05)
             ix, iy, iz = self.get_accel()
             it = math.sqrt(ix**2 + iy**2 + iz**2)
             if it > self.IMPACT_THRESH:
-                print(f"\nIMPACT DETECTED! ({it:.2f}g). Stationary check...")
+                print(f"\nFALL IMPACT: {it:.2f}g. Starting stationary check...")
                 time.sleep(3)
                 samples = [math.sqrt(sum(x**2 for x in self.get_accel())) for _ in range(10)]
                 if np.var(samples) < self.STATIONARY_VAR_THRESH:
-                    print("Worker IMMOBILE. Fall Alarm Active.")
+                    print("FALL ALARM: Worker is immobile.")
                     self.is_fall_alarm = True
                 else:
-                    print("Movement detected. Fall dismissed.")
+                    print("FALL DISMISSED: Movement detected.")
 
+        # 5. Indicators & Debug
         self.update_indicators()
-        print(f"Lux: {lux:6.2f} | Accel: {at:4.2f}g | Touch: {int(is_touched)}", end='\r')
+        print(f"[DEBUG] Lux: {lux:7.2f} | Accel: {at:4.2f}g | Touch: {touch_state} | Active Alarms: F:{int(self.is_fall_alarm)} S:{int(self.is_sos_alarm)} R:{int(self.is_removal_alarm)}", end='\r')
 
 def main():
-    print("Smart Helmet v2.1 (Pi 5 optimized) - Starting...")
+    print("--- Smart Helmet v2.2 (Hardware Resilience Fix) ---")
     helmet = SmartHelmet()
-    print("System Online. Press Ctrl+C to exit.")
+    print("System started successfully. Monitoring loop at 50Hz.")
     
     try:
         while True:
-            start_time = time.time()
-            helmet.process_loop()
+            start = time.time()
+            helmet.run_iteration()
             
-            # Maintain ~50Hz (0.02s loop)
-            elapsed = time.time() - start_time
-            sleep_time = max(0, 0.02 - elapsed)
-            time.sleep(sleep_time)
+            # Maintain 50Hz timing
+            elapsed = time.time() - start
+            time.sleep(max(0, 0.02 - elapsed))
             
     except KeyboardInterrupt:
-        print("\nShutdown requested.")
+        print("\nUser exit detected.")
     finally:
-        # gpiozero handles cleanup automatically on exit, but we force off first
         try:
             helmet.reset_alarms()
         except: pass
-        print("GPIO Cleaned up. Goodbye.")
+        print("GPIO Cleaned up. Exiting.")
 
 if __name__ == "__main__":
     main()
