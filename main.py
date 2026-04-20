@@ -3,7 +3,7 @@ import math
 import sys
 from datetime import datetime
 from smbus2 import SMBus, i2c_msg
-from gpiozero import PWMOutputDevice, LED, Button
+from gpiozero import PWMOutputDevice, RGBLED, Button
 
 # --- Configuration ---
 I2C_BUS = 1
@@ -11,7 +11,9 @@ ADDR_BH = 0x23
 ADDR_MPU = 0x68
 
 PIN_BUZZER = 12
-PIN_LED_RED = 27
+PIN_LED_R = 17
+PIN_LED_G = 27
+PIN_LED_B = 22
 PIN_TOUCH = 24
 
 THRESH_LUX = 30
@@ -57,10 +59,11 @@ def init_hw():
 
 try:
     buzzer = PWMOutputDevice(PIN_BUZZER)
-    led_red = LED(PIN_LED_RED)
+    # the parameters for RGBLED are (red, green, blue)
+    led_rgb = RGBLED(red=PIN_LED_R, green=PIN_LED_G, blue=PIN_LED_B)
     touch_sensor = Button(PIN_TOUCH, pull_up=False)
 except:
-    buzzer, led_red, touch_sensor = None, None, None
+    buzzer, led_rgb, touch_sensor = None, None, None
 
 def get_sensors():
     if bus is None: return 0.0, 1.0
@@ -97,12 +100,19 @@ def pad_banner(text, width=58):
 def render_ui(mode, lux, accel, touch, countdown, event_log):
     sys.stdout.write(CLR)
     
-    print(f"{BLD}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{RST}")
+    # Determine global UI color based on mode
+    ui_col = BMAG # Default border color
+    if mode == "NORMAL": ui_col = BGRN
+    elif mode == "INTENTIONAL_OFF": ui_col = BBLU
+    elif mode == "REMOVAL_WARN": ui_col = BYLW
+    elif mode in ["ALARM", "FALL_ALARM"]: ui_col = BRED
+    
+    print(f"{BLD}{ui_col}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{RST}")
     
     title_text = "SMART HELMET TERMINAL HUD"
     p_l, p_r = pad_banner(title_text)
-    print(f"{BLD}┃{RST}{p_l}{BLD}{BCYN}{title_text}{RST}{p_r}{BLD}┃{RST}")
-    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    print(f"{BLD}{ui_col}┃{RST}{p_l}{BLD}{ui_col}{title_text}{RST}{p_r}{BLD}{ui_col}┃{RST}")
+    print(f"{BLD}{ui_col}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
     
     if mode == "NORMAL":
         p_l, p_r = pad_banner("[  SYSTEM ARMED  ]")
@@ -120,41 +130,40 @@ def render_ui(mode, lux, accel, touch, countdown, event_log):
         p_l, p_r = pad_banner("[  !!! FALL DETECTED !!!  ]")
         banner_str = f"{p_l}{BRED}{INV}[  !!! FALL DETECTED !!!  ]{RST}{p_r}"
         
-    print(f"{BLD}┃{RST}{banner_str}{BLD}┃{RST}")
-    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    print(f"{BLD}{ui_col}┃{RST}{banner_str}{BLD}{ui_col}┃{RST}")
+    print(f"{BLD}{ui_col}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
     
-    l_bar = draw_bar(lux, 150, BCYN, 25) # Max 150 lux for visual scale
+    l_bar = draw_bar(lux, 150, ui_col, 25) # dynamically colored bars
     raw_lux = f"{lux:.1f}lx"
     left_side_lux = f" {BLD}LUX LEVEL:{RST} {raw_lux:>8}  {l_bar}"
-    print(f"{BLD}┃{RST}{left_side_lux}{' ' * 11}{BLD}┃{RST}")
+    print(f"{BLD}{ui_col}┃{RST}{left_side_lux}{' ' * 11}{BLD}{ui_col}┃{RST}")
     
-    a_bar = draw_bar(accel, 5.0, BMAG, 25) # Max 5g for visual scale
+    a_bar = draw_bar(accel, 5.0, ui_col, 25) # dynamically colored bars
     raw_accel = f"{accel:.2f}g"
     left_side_accel = f" {BLD}G-FORCE:  {RST} {raw_accel:>8}  {a_bar}"
-    print(f"{BLD}┃{RST}{left_side_accel}{' ' * 11}{BLD}┃{RST}")
-    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    print(f"{BLD}{ui_col}┃{RST}{left_side_accel}{' ' * 11}{BLD}{ui_col}┃{RST}")
+    print(f"{BLD}{ui_col}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
     
     t_text = "PRESSED" if touch else "RELEASED"
     t_col = BGRN if touch else DIM
     left_side_t = f" {BLD}TOUCH SENSOR:{RST} {t_col}{t_text}{RST}"
     pad_t = 58 - (1 + 13 + 1 + len(t_text))
-    print(f"{BLD}┃{RST}{left_side_t}{' ' * pad_t}{BLD}┃{RST}")
+    print(f"{BLD}{ui_col}┃{RST}{left_side_t}{' ' * pad_t}{BLD}{ui_col}┃{RST}")
     
     c_text = f"{countdown:.1f}s" if mode == "REMOVAL_WARN" else "---"
-    c_col = BYLW if mode == "REMOVAL_WARN" else DIM
-    left_side_c = f" {BLD}COUNTDOWN:   {RST} {c_col}{c_text}{RST}"
+    left_side_c = f" {BLD}COUNTDOWN:   {RST} {ui_col}{c_text}{RST}"
     pad_c = 58 - (1 + 13 + 1 + len(c_text))
-    print(f"{BLD}┃{RST}{left_side_c}{' ' * pad_c}{BLD}┃{RST}")
+    print(f"{BLD}{ui_col}┃{RST}{left_side_c}{' ' * pad_c}{BLD}{ui_col}┃{RST}")
 
-    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
-    print(f"{BLD}┃{RST}{BLD}{BWHT} EVENT LOG:                                               {RST}{BLD}┃{RST}")
+    print(f"{BLD}{ui_col}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    print(f"{BLD}{ui_col}┃{RST}{BLD}{BWHT} EVENT LOG:                                               {RST}{BLD}{ui_col}┃{RST}")
     for i in range(3):
         log_str = event_log[i] if i < len(event_log) else ""
         pad_log = max(0, 58 - (len(log_str) + 1))
         # Ensure log_str string length is purely visible characters
-        print(f"{BLD}┃{RST} {DIM}{log_str}{RST}{' ' * pad_log}{BLD}┃{RST}")
+        print(f"{BLD}{ui_col}┃{RST} {DIM}{log_str}{RST}{' ' * pad_log}{BLD}{ui_col}┃{RST}")
     
-    print(f"{BLD}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{RST}")
+    print(f"{BLD}{ui_col}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{RST}")
     sys.stdout.flush()
 
 
@@ -213,7 +222,7 @@ def main():
             # --- Status Transitions ---
             if mode != last_mode:
                 if mode == "INTENTIONAL_OFF":
-                    log_event("Mute Activated")
+                    log_event("Mute Activated (INTENTIONAL OFF)")
                 elif mode == "FALL_ALARM":
                     log_event("Impact Detected (> 3g)")
                 elif mode == "ALARM":
@@ -225,23 +234,28 @@ def main():
                 last_mode = mode
                     
             # --- Hardware Drive ---
-            if buzzer is not None and led_red is not None:
+            if led_rgb is not None:
                 if mode in ["ALARM", "FALL_ALARM"]:
-                    led_red.on()
-                    buzzer.value = 0.5 if int(now * 8) % 2 else 0
+                    led_rgb.color = (1, 0, 0) # Solid Red
+                    if buzzer: buzzer.value = 0.5 if int(now * 8) % 2 else 0
                 elif mode == "REMOVAL_WARN":
-                    led_red.value = int(now * 4) % 2
-                    buzzer.off()
-                else: # INTENTIONAL_OFF or NORMAL
-                    led_red.off()
-                    buzzer.off()
+                    # Pulse Red/Yellow
+                    blink = int(now * 4) % 2 == 1
+                    led_rgb.color = (1, 0, 0) if blink else (1, 1, 0)
+                    if buzzer: buzzer.off()
+                elif mode == "INTENTIONAL_OFF":
+                    led_rgb.color = (0, 0, 1) # Blue
+                    if buzzer: buzzer.off()
+                else: # NORMAL
+                    led_rgb.color = (0, 1, 0) # Green
+                    if buzzer: buzzer.off()
                     
             # Render to screen
             render_ui(mode, lux, accel, touch, countdown, event_log)
             time.sleep(0.1)
             
     except KeyboardInterrupt:
-        if led_red: led_red.off()
+        if led_rgb: led_rgb.off()
         if buzzer: buzzer.off()
         print(CLR)
         print(f"{BGRN}System Shutdown Cleanly.{RST}")
