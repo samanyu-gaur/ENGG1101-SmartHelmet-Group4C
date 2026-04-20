@@ -18,62 +18,55 @@ LUX_THRESHOLD = 50
 REMOVAL_DELAY = 5.0
 FALL_THRESHOLD = 3.0
 
-# --- ANSI Cyberpunk Styling ---
+# --- ANSI UI Codes ---
 CLR = "\033[H\033[J"
 RST = "\033[0m"
 BLD = "\033[1m"
-RED = "\033[31m"
-GRN = "\033[32m"
-YLW = "\033[33m"
-BLU = "\033[34m"
-MAG = "\033[35m"
-CYN = "\033[36m"
-BG_BLU = "\033[44m"
+RED = "\033[91m"
+GRN = "\033[92m"
+YLW = "\033[93m"
+CYN = "\033[96m"
+BLU = "\033[94m"
 
 # --- Global State ---
-state = {
-    "lux": 0.0,
-    "accel": 1.0,
-    "alarm": False,
-    "warning": False,
-    "status": "SYSTEM NOMINAL",
-    "warning_start": None,
-    "logs": ["- SYSTEM BOOT INITIALIZED", "- WAITING FOR SENSORS", "- READY"],
-    "glitch": False
-}
-
-# --- Hardware Initialization ---
 bus = SMBus(I2C_BUS)
+alarm_active = False
+removal_warning = False
+warning_start_time = None
+last_lux = 0.0
+last_accel = 1.0
+status_msg = "MONITORING ACTIVE"
 
-def kickstart_sensors():
+def init_sensors():
+    """Requirement 1: BH1750 Wake Up Protocol"""
     try:
-        # BH1750 Kickstart (Power Down -> Power On -> Reset)
-        bus.write_byte(BH_ADDR, 0x00) # Power Down
-        time.sleep(0.1)
+        # BH1750 initialization sequence
         bus.write_byte(BH_ADDR, 0x01) # Power On
-        time.sleep(0.1)
         bus.write_byte(BH_ADDR, 0x07) # Reset
         time.sleep(0.1)
-        bus.write_byte(BH_ADDR, 0x10) # Continuous High Res Mode
+        bus.write_byte(BH_ADDR, 0x10) # Continuous H-Res Mode
         
-        # MPU6050 Wake
+        # MPU6050 Wake Up
         bus.write_byte_data(MPU_ADDR, 0x6B, 0x00)
         return True
     except:
         return False
 
+# Hardware Setup
 buzzer = PWMOutputDevice(BUZZER_PIN)
 led_red = LED(RED_LED_PIN)
 led_green = LED(GREEN_LED_PIN)
 touch_sensor = Button(TOUCH_PIN, pull_up=False)
 
-def get_sensor_data():
+def get_data():
+    """Requirement 1: Robust data reading with recovery"""
+    global last_lux, last_accel
     try:
-        # Lux
+        # Read BH1750
         l_data = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
         lux = ((l_data[0] << 8) | l_data[1]) / 1.2
         
-        # Accel (G-Force)
+        # Read MPU6050
         a_data = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 6)
         def rw(h, l):
             v = (h << 8) | l
@@ -83,125 +76,116 @@ def get_sensor_data():
         az = rw(a_data[4], a_data[5]) / 16384.0
         accel = math.sqrt(ax**2 + ay**2 + az**2)
         
-        return lux, accel, False
+        last_lux, last_accel = lux, accel
+        return lux, accel
     except:
-        return 0.0, 1.0, True
+        # Mid-loop re-initialization if I2C fails
+        init_sensors()
+        return last_lux, last_accel
 
-def add_log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    state["logs"].append(f"- [{ts}] {msg}")
-    if len(state["logs"]) > 3:
-        state["logs"].pop(0)
-
-def draw_ui():
-    # Header
+def draw_dashboard():
+    """Requirement 2: High-End Terminal UI"""
     print(CLR, end="")
-    print(f"{BLD}{BG_BLU}{' ' * 60}{RST}")
-    print(f"{BLD}{BG_BLU}  HKU ENGG1101 - SMART HELMET SYSTEM - GROUP 4C        {RST}")
-    print(f"{BLD}{BG_BLU}{' ' * 60}{RST}\n")
+    print(f"{BLD}{CYN}╔══════════════════════════════════════════════════════╗{RST}")
+    print(f"{BLD}{CYN}║       GROUP 4C - SMART HELMET COMMAND CENTER         ║{RST}")
+    print(f"{BLD}{CYN}╚══════════════════════════════════════════════════════╝{RST}\n")
 
     # Status Bar
-    status_color = RED if state["alarm"] else (YLW if state["warning"] else GRN)
-    print(f"{BLD}SYSTEM STATE:{RST} {status_color}{BLD}{state['status']}{RST}")
-    print(f"{BLU}------------------------------------------------------------{RST}")
+    status_color = RED if alarm_active else (YLW if removal_warning else GRN)
+    print(f"{BLD} SYSTEM STATUS: {status_color}{status_msg.upper()}{RST}\n")
 
-    # Telemetry
-    lux_color = YLW if state["warning"] else (RED if state["lux"] > LUX_THRESHOLD else GRN)
-    accel_color = RED if state["accel"] > FALL_THRESHOLD else GRN
+    # Sensor Rows
+    lux_color = YLW if last_lux > LUX_THRESHOLD else GRN
+    lux_label = f" {RED}{BLD}[REMOVAL DETECTED]{RST}" if last_lux > LUX_THRESHOLD else ""
+    print(f"{BLD} >   LIGHT LEVEL: {lux_color}{last_lux:>8.1f} Lux{RST} {lux_label}")
+
+    accel_color = RED if last_accel > FALL_THRESHOLD else GRN
+    accel_label = f" {RED}{BLD}[FALL DETECTED]{RST}" if last_accel > FALL_THRESHOLD else ""
+    print(f"{BLD} >   MOTION LOAD: {accel_color}{last_accel:>8.2f} g  {RST} {accel_label}\n")
+
+    # Logic & Timers
+    print(f"{BLU}────────────────────────────────────────────────────────{RST}")
+    if removal_warning and not alarm_active:
+        elapsed = time.time() - warning_start_time
+        remaining = max(0, REMOVAL_DELAY - elapsed)
+        # Visual countdown
+        bar = "█" * int(remaining * 4)
+        print(f"{YLW}{BLD} [TIMER] ALARM TRIGGER IN: {remaining:.1f}s {RST}")
+        print(f"{YLW} [{bar:<20}]{RST}")
+    elif alarm_active:
+        print(f"{RED}{BLD} [ALERT] CRITICAL ALARM ACTIVE - CHECK OPERATOR{RST}")
+        print(f"{RED} [ACTION] PRESS TOUCH SENSOR TO HARD RESET{RST}")
+    else:
+        print(f"{GRN} [SYSTEM] OPERATING NOMINALLY - ALL SYSTEMS GO{RST}")
+    print(f"{BLU}────────────────────────────────────────────────────────{RST}")
     
-    if state["glitch"]:
-        print(f"{RED}{BLD}!! SENSOR GLITCH - RETRYING HARDWARE BUS !!{RST}")
-    else:
-        print(f"{BLD}AMBIENT LIGHT:{RST} {lux_color}{state['lux']:>8.1f} Lux{RST}  (Limit: {LUX_THRESHOLD})")
-        print(f"{BLD}RESULTANT G:  {RST} {accel_color}{state['accel']:>8.2f} g  {RST}  (Limit: {FALL_THRESHOLD})")
-
-    # Warnings / Timers
-    print(f"{BLU}------------------------------------------------------------{RST}")
-    if state["warning"] and not state["alarm"]:
-        rem = max(0, REMOVAL_DELAY - (time.time() - state["warning_start"]))
-        print(f"{YLW}{BLD}>> REMOVAL WARNING: {rem:.1f}s UNTIL ALARM <<{RST}")
-    elif state["alarm"]:
-        print(f"{RED}{BLD}>> ALARM ACTIVE: PRESS TOUCH SENSOR TO CLEAR <<{RST}")
-    else:
-        print(f"{GRN}HELMET SECURE - MONITORING ACTIVE{RST}")
-
-    # Logs
-    print(f"\n{BLD}{CYN}EVENT LOG (RECENT 3):{RST}")
-    for log in state["logs"]:
-        print(f"{CYN}{log}{RST}")
-    print(f"{BLU}------------------------------------------------------------{RST}")
+    # Footer
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n {BLD}{CYN}LOGGED AT: {ts}{RST}")
 
 def main():
-    if not kickstart_sensors():
-        print("CRITICAL: Failed to kickstart I2C bus.")
+    global alarm_active, removal_warning, warning_start_time, status_msg
+    if not init_sensors():
+        print("Initialization failed. Check I2C wiring.")
         return
 
     try:
         while True:
-            lux, accel, glitch = get_sensor_data()
+            lux, accel = get_data()
             touch = touch_sensor.is_pressed
-            state["lux"] = lux
-            state["accel"] = accel
-            state["glitch"] = glitch
 
-            # Reset Logic
+            # Requirement 3: Reset Logic
             if touch:
-                if state["alarm"] or state["warning"]:
-                    add_log("MANUAL RESET DETECTED")
-                state["alarm"] = False
-                state["warning"] = False
-                state["warning_start"] = None
-                state["status"] = "SYSTEM NOMINAL"
+                alarm_active = False
+                removal_warning = False
+                warning_start_time = None
+                status_msg = "MONITORING ACTIVE"
 
-            # Safety Logic
-            if not state["alarm"]:
+            # Requirement 3: Safety Logic
+            if not alarm_active:
+                # Fall Detection (Immediate)
                 if accel > FALL_THRESHOLD:
-                    state["alarm"] = True
-                    state["status"] = "FALL DETECTED!"
-                    add_log(f"FALL IMPACT: {accel:.2f}g")
+                    alarm_active = True
+                    status_msg = "ALARM: CRITICAL IMPACT"
+                
+                # Removal Detection (5s Timer)
                 elif lux > LUX_THRESHOLD:
-                    if not state["warning"]:
-                        state["warning"] = True
-                        state["warning_start"] = time.time()
-                        state["status"] = "HELMET REMOVAL DETECTED"
-                        add_log("REMOVAL WARNING TRIGGERED")
-                    elif time.time() - state["warning_start"] > REMOVAL_DELAY:
-                        if not touch:
-                            state["alarm"] = True
-                            state["status"] = "ALARM: UNAUTHORIZED REMOVAL"
-                            add_log("ALARM: 5S GRACE PERIOD EXPIRED")
+                    if not removal_warning:
+                        removal_warning = True
+                        warning_start_time = time.time()
+                        status_msg = "WARNING: HELMET REMOVED"
+                    elif time.time() - warning_start_time > REMOVAL_DELAY:
+                        if not touch: # Trigger if not reset
+                            alarm_active = True
+                            status_msg = "ALARM: UNAUTHORIZED REMOVAL"
                 else:
-                    state["warning"] = False
-                    state["warning_start"] = None
-                    if not state["alarm"]:
-                        state["status"] = "SYSTEM NOMINAL"
+                    removal_warning = False
+                    if not alarm_active: status_msg = "MONITORING ACTIVE"
 
-            # Hardware Output
-            if state["alarm"]:
+            # Requirement 3: Hardware Output
+            if alarm_active:
                 led_green.off()
                 led_red.on()
-                if state["status"].startswith("FALL"):
-                    buzzer.value = 0.5 # Constant Siren
-                else:
-                    buzzer.value = 0.5 if int(time.time() * 5) % 2 else 0 # Fast Pulse
-            elif state["warning"]:
+                # Siren Effect
+                buzzer.value = 0.5 if int(time.time() * 6) % 2 else 0
+            elif removal_warning:
                 led_green.off()
-                if int(time.time() * 4) % 2: led_red.on()
-                else: led_red.off()
+                # Warning Flash
+                led_red.value = 1 if int(time.time() * 4) % 2 else 0
                 buzzer.off()
             else:
                 led_green.on()
                 led_red.off()
                 buzzer.off()
 
-            draw_ui()
-            time.sleep(0.1)
+            draw_dashboard()
+            time.sleep(0.1) # Requirement 4: CPU efficiency
 
     except KeyboardInterrupt:
         led_red.off()
         led_green.off()
         buzzer.off()
-        print(f"\n{GRN}SHUTDOWN COMPLETE.{RST}")
+        print(f"\n{GRN}Shutdown successful.{RST}")
 
 if __name__ == "__main__":
     main()
