@@ -8,8 +8,7 @@ from gpiozero import PWMOutputDevice, LED, Button
 
 # --- Configuration ---
 I2C_BUS = 1
-ADDR_BH_PRIMARY = 0x23
-ADDR_BH_SECONDARY = 0x5C
+ADDR_BH = 0x23
 ADDR_MPU = 0x68
 
 PIN_BUZZER = 12
@@ -42,7 +41,6 @@ state = {
     "warning_start": None,
     "sensor_health": "INITIALIZING",
     "last_reset": "NEVER",
-    "bh_addr": ADDR_BH_PRIMARY,
     "timestamp": ""
 }
 data_lock = threading.Lock()
@@ -54,46 +52,41 @@ led_red = LED(PIN_LED_RED)
 led_grn = LED(PIN_LED_GRN)
 touch_sensor = Button(PIN_TOUCH, pull_up=False)
 
-def init_bh1750(addr):
+def init_bh1750():
     """Requirement 1: Resurrection Logic"""
     try:
-        bus.write_byte(addr, 0x01) # Power On
-        bus.write_byte(addr, 0x07) # Reset
-        time.sleep(0.2)            # 200ms Wait
-        bus.write_byte(addr, 0x10) # High-Res Mode
+        bus.write_byte(ADDR_BH, 0x01) # Power On
+        bus.write_byte(ADDR_BH, 0x07) # Reset
+        time.sleep(0.2)
+        bus.write_byte(ADDR_BH, 0x10) # High-Res Mode
         return True
     except:
         return False
 
 def setup_hardware():
     # Wake MPU6050
-    try: bus.write_byte_data(ADDR_MPU, 0x6B, 0x00)
-    except: pass
+    try:
+        bus.write_byte_data(ADDR_MPU, 0x6B, 0x00)
+    except:
+        pass
     
-    # Try Primary BH1750
-    if init_bh1750(ADDR_BH_PRIMARY):
-        state["bh_addr"] = ADDR_BH_PRIMARY
-        state["sensor_health"] = "OK (0x23)"
-    elif init_bh1750(ADDR_BH_SECONDARY):
-        state["bh_addr"] = ADDR_BH_SECONDARY
-        state["sensor_health"] = "OK (0x5C)"
+    # Init BH1750
+    if init_bh1750():
+        state["sensor_health"] = "ONLINE"
     else:
-        state["sensor_health"] = "BH1750 ERR"
+        state["sensor_health"] = "BH1750 ERROR"
 
 def get_sensor_readings():
     lux, accel = 0.0, 1.0
-    # Read Lux with Recovery
+    # Read Lux with Requirement 1: Resurrection/Soft Reset
     try:
-        data = bus.read_i2c_block_data(state["bh_addr"], 0x10, 2)
+        data = bus.read_i2c_block_data(ADDR_BH, 0x10, 2)
         lux = ((data[0] << 8) | data[1]) / 1.2
-        if lux == 0.0: # Resurrection Trigger
-            init_bh1750(state["bh_addr"])
+        if lux == 0.0:
+            bus.write_byte(ADDR_BH, 0x01) # Soft Reset if stuck at 0
+        state["sensor_health"] = "ONLINE"
     except:
-        # Try alternate address on failure
-        new_addr = ADDR_BH_SECONDARY if state["bh_addr"] == ADDR_BH_PRIMARY else ADDR_BH_PRIMARY
-        if init_bh1750(new_addr):
-            state["bh_addr"] = new_addr
-            state["sensor_health"] = f"RECOVERED ({hex(new_addr)})"
+        state["sensor_health"] = "SENSOR DISCONNECTED"
 
     # Read Accel
     try:
@@ -101,9 +94,12 @@ def get_sensor_readings():
         def rw(h, l):
             v = (h << 8) | l
             return v - 65536 if v >= 32768 else v
-        ax, ay, az = rw(d[0], d[1])/16384.0, rw(d[2], d[3])/16384.0, rw(d[4], d[5])/16384.0
+        ax = rw(d[0], d[1])/16384.0
+        ay = rw(d[2], d[3])/16384.0
+        az = rw(d[4], d[5])/16384.0
         accel = math.sqrt(ax**2 + ay**2 + az**2)
-    except: pass
+    except:
+        pass
     
     return lux, accel
 
@@ -119,14 +115,14 @@ def render_ui():
         
         # Flashing Header
         header_color = RED if (state["alarm"] and int(time.time()*2)%2) else CYN
-        header_text = " !! ALARM !! " if state["alarm"] else " GUARDIAN OS v4.0 "
+        header_text = " !! ALARM !! " if state["alarm"] else " CYBER GUARDIAN OS "
         print(f"{BLD}{header_color}╔══════════════════════════════════════════════════════╗{RST}")
         print(f"{BLD}{header_color}║ {header_text:^52} ║{RST}")
         print(f"{BLD}{header_color}╚══════════════════════════════════════════════════════╝{RST}\n")
 
         # Telemetry Gauges
-        print(draw_gauge("LIGHT", state["lux"], 150, YLW if state["lux"] > THRESH_LUX else GRN))
-        print(draw_gauge("FORCE", state["accel"], 5, RED if state["accel"] > THRESH_FALL else GRN))
+        print(draw_gauge("LIGHT", state["lux"], 200, YLW if state["lux"] > THRESH_LUX else GRN))
+        print(draw_gauge("G-FORCE", state["accel"], 5, RED if state["accel"] > THRESH_FALL else GRN))
         print("")
 
         # Status Table
@@ -194,7 +190,8 @@ def main():
             if state["alarm"]:
                 led_grn.off()
                 led_red.on()
-                buzzer.value = 0.5 if int(time.time() * 8) % 2 else 0 # Rapid Siren
+                # Rapid Siren
+                buzzer.value = 0.5 if int(time.time() * 8) % 2 else 0 
             elif state["warning"]:
                 led_grn.off()
                 led_red.value = int(time.time() * 4) % 2
@@ -204,7 +201,7 @@ def main():
                 led_red.off()
                 buzzer.off()
 
-            # UI Throttling
+            # UI Update
             if time.time() - last_ui_update > 0.1:
                 render_ui()
                 last_ui_update = time.time()
