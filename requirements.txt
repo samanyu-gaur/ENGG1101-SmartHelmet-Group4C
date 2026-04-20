@@ -5,3 +5,4 @@ pandas
 flask
 dash
 plotly
+rich

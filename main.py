@@ -3,9 +3,15 @@ import threading
 import math
 import os
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify
-from gpiozero import PWMOutputDevice, LED, Button
+from gpiozero import PWMOutputDevice, Button
 from smbus2 import SMBus
+from rich.live import Live
+from rich.table import Table
+from rich.layout import Layout
+from rich.panel import Panel
+from rich.console import Console
+from rich import box
+from flask import Flask, jsonify, render_template_string
 
 # --- Configuration ---
 I2C_BUS = 1
@@ -21,205 +27,189 @@ REMOVAL_DELAY = 5.0
 FALL_THRESHOLD = 3.0
 
 # --- Global State ---
-# "Heartbeat" ensures the UI knows the Python script is still running even if I2C fails
-system_state = {
+state = {
     "lux": 0.0,
     "accel": 1.0,
     "alarm": False,
     "warning": False,
-    "status": "Initializing...",
+    "status": "SAFE",
     "timestamp": "",
-    "heartbeat": 0,
-    "i2c_online": False
+    "cpu_temp": 0.0,
+    "logs": ["System Booting...", "Ready."],
+    "online": True
 }
 data_lock = threading.Lock()
 i2c_lock = threading.Lock()
 
-# --- Hardware Initialization (Safe Mode) ---
-# Using PWMOutputDevice for Buzzer to prevent "Out of Range" errors
+# --- Hardware Setup ---
 buzzer = PWMOutputDevice(BUZZER_PIN)
-led_red = LED(RED_LED_PIN)
-led_green = LED(GREEN_LED_PIN)
+led_red = PWMOutputDevice(RED_LED_PIN)
+led_green = PWMOutputDevice(GREEN_LED_PIN)
 touch_sensor = Button(TOUCH_PIN, pull_up=False)
+
+def get_cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            return float(f.read()) / 1000.0
+    except: return 0.0
 
 def setup_sensors():
     global bus
     with i2c_lock:
         try:
             bus = SMBus(I2C_BUS)
-            bus.write_byte_data(MPU_ADDR, 0x6B, 0x00) # Wake MPU
-            bus.write_byte(BH_ADDR, 0x01) # Power BH
+            bus.write_byte_data(MPU_ADDR, 0x6B, 0x00)
+            bus.write_byte(BH_ADDR, 0x01)
             time.sleep(0.1)
-            bus.write_byte(BH_ADDR, 0x10) # Continuous High Res
+            bus.write_byte(BH_ADDR, 0x10)
             return True
-        except Exception as e:
-            print(f"I2C Setup Warning: {e}")
-            return False
-
-# --- Sensor Logic (Robust Shield) ---
-def get_safe_data():
-    lux, accel = 0.0, 1.0
-    online = False
-    with i2c_lock:
-        try:
-            # Read Lux
-            l_data = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
-            lux = ((l_data[0] << 8) | l_data[1]) / 1.2
-            
-            # Read Accel
-            a_data = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 6)
-            def rw(h, l):
-                v = (h << 8) | l
-                return v - 65536 if v >= 32768 else v
-            ax = rw(a_data[0], a_data[1]) / 16384.0
-            ay = rw(a_data[2], a_data[3]) / 16384.0
-            az = rw(a_data[4], a_data[5]) / 16384.0
-            accel = math.sqrt(ax**2 + ay**2 + az**2)
-            online = True
-        except:
-            pass # REQUIREMENT: Do not crash if sensors fail
-    return lux, accel, online
+        except: return False
 
 def sensor_thread():
-    global system_state
+    global state
     warning_start = None
     setup_sensors()
     
     while True:
-        lux, accel, online = get_safe_data()
+        lux, accel, online = 0.0, 1.0, False
+        with i2c_lock:
+            try:
+                # Lux
+                d = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
+                lux = ((d[0] << 8) | d[1]) / 1.2
+                # Accel
+                d = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 6)
+                def rw(h, l):
+                    v = (h << 8) | l
+                    return v - 65536 if v >= 32768 else v
+                ax, ay, az = rw(d[0], d[1])/16384.0, rw(d[2], d[3])/16384.0, rw(d[4], d[5])/16384.0
+                accel = math.sqrt(ax**2 + ay**2 + az**2)
+                online = True
+            except: pass
+
         touch = touch_sensor.is_pressed
         
         with data_lock:
-            system_state["heartbeat"] += 1
-            system_state["lux"] = round(lux, 2)
-            system_state["accel"] = round(accel, 2)
-            system_state["i2c_online"] = online
-            system_state["timestamp"] = datetime.now().strftime("%H:%M:%S")
+            state["lux"] = round(lux, 2)
+            state["accel"] = round(accel, 2)
+            state["cpu_temp"] = round(get_cpu_temp(), 1)
+            state["timestamp"] = datetime.now().strftime("%H:%M:%S")
+            state["online"] = online
 
             if touch:
-                system_state["alarm"] = False
-                system_state["warning"] = False
-                system_state["status"] = "Safe (Reset)"
+                if state["alarm"] or state["warning"]:
+                    state["logs"].append(f"[{state['timestamp']}] Reset Pressed.")
+                state["alarm"] = False
+                state["warning"] = False
+                state["status"] = "SAFE"
                 warning_start = None
 
-            if not system_state["alarm"]:
+            if not state["alarm"]:
                 if accel > FALL_THRESHOLD:
-                    system_state["alarm"] = True
-                    system_state["status"] = "FALL DETECTED"
+                    state["alarm"] = True
+                    state["status"] = "FALL DETECTED"
+                    state["logs"].append(f"[{state['timestamp']}] CRITICAL: Fall Detected ({accel}g)")
                 elif lux > LUX_THRESHOLD:
-                    if not system_state["warning"]:
-                        system_state["warning"] = True
-                        system_state["status"] = "REMOVAL WARNING"
+                    if not state["warning"]:
+                        state["warning"] = True
+                        state["status"] = "REMOVAL WARNING"
                         warning_start = time.time()
+                        state["logs"].append(f"[{state['timestamp']}] Warning: Helmet Removed")
                     elif time.time() - warning_start > REMOVAL_DELAY:
                         if not touch:
-                            system_state["alarm"] = True
-                            system_state["status"] = "HELMET REMOVED"
+                            state["alarm"] = True
+                            state["status"] = "ALARM: REMOVAL"
+                            state["logs"].append(f"[{state['timestamp']}] CRITICAL: 5s Timer Expired")
                 else:
-                    system_state["warning"] = False
-                    if not system_state["alarm"]: system_state["status"] = "Normal"
+                    state["warning"] = False
+                    if not state["alarm"]: state["status"] = "SAFE"
                     warning_start = None
+            
+            # Keep logs to last 5
+            if len(state["logs"]) > 5: state["logs"].pop(0)
 
         # Hardware Feedback
-        if system_state["alarm"]:
-            led_green.off()
-            led_red.on()
-            buzzer.value = 0.5 # 50% Duty Cycle for Siren
-        elif system_state["warning"]:
-            led_green.off()
-            led_red.value = int(time.time() * 4) % 2
-            buzzer.off()
+        if state["alarm"]:
+            led_green.value = 0
+            led_red.value = 1
+            buzzer.value = 0.5
+        elif state["warning"]:
+            led_green.value = 0
+            led_red.value = 1 if int(time.time() * 4) % 2 else 0
+            buzzer.value = 0
         else:
-            led_green.on()
-            led_red.off()
-            buzzer.off()
+            led_green.value = 1
+            led_red.value = 0
+            buzzer.value = 0
 
         time.sleep(0.05)
 
-# --- Web Interface (Emergency Template) ---
-app = Flask(__name__)
+# --- Terminal UI Layout ---
+def make_layout() -> Layout:
+    layout = Layout()
+    layout.split(
+        Layout(name="header", size=3),
+        Layout(name="main", size=10),
+        Layout(name="footer", size=8),
+    )
+    return layout
 
-HTML_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Emergency Smart Helmet Console</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        body { background: #0a0a0a; color: #fff; font-family: sans-serif; }
-        .dashboard { max-width: 800px; margin: 40px auto; padding: 20px; }
-        .status-card { background: #1a1a1a; border-radius: 15px; padding: 30px; text-align: center; border: 2px solid #333; }
-        .alarm-active { border-color: #ff0000; box-shadow: 0 0 20px rgba(255,0,0,0.4); }
-        .val-large { font-size: 4rem; font-weight: bold; margin: 10px 0; }
-        .label { color: #888; text-transform: uppercase; font-size: 0.9rem; }
-        .heartbeat { color: #00ff00; font-family: monospace; }
-        .i2c-error { color: #ff0000; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <div class="dashboard">
-        <div id="main-card" class="status-card">
-            <h2 id="status-text">INITIALIZING...</h2>
-            <div id="val-display" class="val-large">0.0g</div>
-            <div class="row mt-4">
-                <div class="col-6">
-                    <div class="label">Light Sensor</div>
-                    <h3 id="lux-val">0 Lux</h3>
-                </div>
-                <div class="col-6">
-                    <div class="label">System Heartbeat</div>
-                    <div id="heartbeat" class="heartbeat">0</div>
-                </div>
-            </div>
-            <div id="i2c-status" class="mt-3"></div>
-        </div>
-    </div>
-
-    <script>
-        async function update() {
-            try {
-                const res = await fetch('/data');
-                const d = await res.json();
-                
-                document.getElementById('status-text').innerText = d.status.toUpperCase();
-                document.getElementById('val-display').innerText = d.accel + 'g';
-                document.getElementById('lux-val').innerText = d.lux + ' Lux';
-                document.getElementById('heartbeat').innerText = 'PULSE: ' + d.heartbeat;
-                
-                const card = document.getElementById('main-card');
-                if(d.alarm) {
-                    card.style.borderColor = '#ff0000';
-                    card.style.background = '#2a0000';
-                } else if(d.warning) {
-                    card.style.borderColor = '#ffff00';
-                    card.style.background = '#1a1a00';
-                } else {
-                    card.style.borderColor = '#333';
-                    card.style.background = '#1a1a1a';
-                }
-
-                const i2c = document.getElementById('i2c-status');
-                i2c.innerHTML = d.i2c_online ? '' : '<span class="i2c-error">I2C BUS OFFLINE - CHECK WIRING</span>';
-            } catch(e) {}
-        }
-        setInterval(update, 500);
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def home():
-    return render_template_string(HTML_PAGE)
-
-@app.route('/data')
-def data():
+def update_ui(layout: Layout):
     with data_lock:
-        return jsonify(system_state)
+        # Header
+        status_color = "red" if state["alarm"] else ("yellow" if state["warning"] else "green")
+        online_str = "[green]ONLINE[/]" if state["online"] else "[red]OFFLINE[/]"
+        header_table = Table.grid(expand=True)
+        header_table.add_column(justify="left")
+        header_table.add_column(justify="center")
+        header_table.add_column(justify="right")
+        header_table.add_row(
+            f" [b]HELMET STATUS:[/] [{status_color}]{state['status']}[/]",
+            f"[b]CORE TEMP:[/] {state['cpu_temp']}°C",
+            f"{state['timestamp']} | {online_str} "
+        )
+        layout["header"].update(Panel(header_table, style="white on blue", box=box.ROUNDED))
 
-if __name__ == "__main__":
-    t = threading.Thread(target=sensor_thread, daemon=True)
-    t.start()
-    # REQUIREMENT: Port 8080 for school networks
+        # Main Table
+        main_table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
+        main_table.add_column("Sensor", justify="center", style="cyan")
+        main_table.add_column("Current Reading", justify="center", style="magenta")
+        main_table.add_column("Threshold", justify="center", style="white")
+        main_table.add_column("Status", justify="center")
+
+        lux_status = "[red]HIGH[/]" if state["lux"] > LUX_THRESHOLD else "[green]NORMAL[/]"
+        accel_status = "[red]SPIKE[/]" if state["accel"] > FALL_THRESHOLD else "[green]NORMAL[/]"
+
+        main_table.add_row("BH1750 (Lux)", f"{state['lux']} lx", f"> {LUX_THRESHOLD}", lux_status)
+        main_table.add_row("MPU6050 (G)", f"{state['accel']} g", f"> {FALL_THRESHOLD}", accel_status)
+        layout["main"].update(Panel(main_table, title="[b]Live Telemetry[/]", border_style="bright_blue"))
+
+        # Footer / Logs
+        log_content = "\n".join(state["logs"])
+        layout["footer"].update(Panel(log_content, title="[b]Event History[/]", border_style="yellow"))
+
+# --- Flask Server (Background) ---
+app = Flask(__name__)
+@app.route('/data')
+def get_data():
+    with data_lock: return jsonify(state)
+
+def run_flask():
     app.run(host='0.0.0.0', port=8080, threaded=True, debug=False)
+
+# --- Entry Point ---
+if __name__ == "__main__":
+    # Start Logic & Web
+    t_sensor = threading.Thread(target=sensor_thread, daemon=True)
+    t_sensor.start()
+    
+    t_flask = threading.Thread(target=run_flask, daemon=True)
+    t_flask.start()
+
+    # Launch Terminal UI
+    console = Console()
+    layout = make_layout()
+    with Live(layout, refresh_per_second=10, screen=True) as live:
+        while True:
+            update_ui(layout)
+            time.sleep(0.1)
