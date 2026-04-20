@@ -5,7 +5,7 @@ import os
 import math
 import pandas as pd
 from datetime import datetime
-from flask import Flask
+from flask import Flask, render_template, jsonify
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objs as go
@@ -27,25 +27,21 @@ FALL_THRESHOLD = 3.0
 REMOVAL_DELAY = 5.0
 HISTORY_FILE = 'helmet_history.csv'
 
-# --- Global State ---
-class HelmetState:
-    def __init__(self):
-        self.lux = 0.0
-        self.accel_total = 1.0
-        self.alarm_active = False
-        self.alarm_type = None  # 'Fall' or 'Removal'
-        self.removal_warning = False
-        self.removal_start_time = None
-        self.touch_pressed = False
-        self.lock = threading.Lock()
-        
-        # History for charts
-        self.accel_history = []
-        self.lux_history = []
-        self.timestamps = []
-        self.max_points = 50
-
-state = HelmetState()
+# --- Global State (Requirement: sensor_data dictionary) ---
+sensor_data = {
+    "lux": 0.0,
+    "accel": 1.0,
+    "alarm": False,
+    "alarm_type": None,
+    "warning": False,
+    "touch": False,
+    "timestamp": "",
+    "accel_history": [],
+    "lux_history": [],
+    "time_history": []
+}
+data_lock = threading.Lock()
+MAX_HISTORY = 50
 
 # --- Hardware Initialization ---
 bus = SMBus(I2C_BUS)
@@ -56,10 +52,8 @@ touch_sensor = Button(TOUCH_PIN, pull_up=False)
 
 def setup_sensors():
     try:
-        # Wake up MPU6050
-        bus.write_byte_data(MPU_ADDR, 0x6B, 0x00)
-        # BH1750 Power On and Continuous High Res Mode
-        bus.write_byte(BH_ADDR, 0x01) # Power On
+        bus.write_byte_data(MPU_ADDR, 0x6B, 0x00) # Wake MPU
+        bus.write_byte(BH_ADDR, 0x01) # Power On BH
         time.sleep(0.1)
         bus.write_byte(BH_ADDR, 0x10) # Continuous High Res Mode
     except Exception as e:
@@ -69,8 +63,7 @@ def get_lux():
     try:
         data = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
         return ((data[0] << 8) | data[1]) / 1.2
-    except:
-        return 0.0
+    except: return 0.0
 
 def get_accel():
     try:
@@ -78,12 +71,9 @@ def get_accel():
         def read_word(h, l):
             val = (h << 8) | l
             return val - 65536 if val >= 32768 else val
-        ax = read_word(data[0], data[1]) / 16384.0
-        ay = read_word(data[2], data[3]) / 16384.0
-        az = read_word(data[4], data[5]) / 16384.0
+        ax, ay, az = read_word(data[0], data[1])/16384.0, read_word(data[2], data[3])/16384.0, read_word(data[4], data[5])/16384.0
         return math.sqrt(ax**2 + ay**2 + az**2)
-    except:
-        return 1.0
+    except: return 1.0
 
 def log_incident(type, value):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -94,81 +84,72 @@ def log_incident(type, value):
             writer.writerow(['Timestamp', 'Alarm Type', 'Sensor Value'])
         writer.writerow([now, type, f"{value:.2f}"])
 
-# --- Background Logic ---
+# --- Background Thread (Requirement: sensor_loop) ---
 def sensor_loop():
-    global state
+    global sensor_data
     setup_sensors()
+    removal_start = None
     
     while True:
         lux = get_lux()
         accel = get_accel()
         touch = touch_sensor.is_pressed
-        now = time.time()
+        now_ts = datetime.now().strftime("%H:%M:%S")
         
-        with state.lock:
-            state.lux = lux
-            state.accel_total = accel
-            state.touch_pressed = touch
+        with data_lock:
+            sensor_data["lux"] = lux
+            sensor_data["accel"] = accel
+            sensor_data["touch"] = touch
+            sensor_data["timestamp"] = now_ts
             
-            # Update history
-            state.timestamps.append(datetime.now().strftime("%H:%M:%S"))
-            state.accel_history.append(accel)
-            state.lux_history.append(lux)
-            if len(state.accel_history) > state.max_points:
-                state.accel_history.pop(0)
-                state.lux_history.pop(0)
-                state.timestamps.pop(0)
+            # History management
+            sensor_data["accel_history"].append(accel)
+            sensor_data["lux_history"].append(lux)
+            sensor_data["time_history"].append(now_ts)
+            if len(sensor_data["accel_history"]) > MAX_HISTORY:
+                sensor_data["accel_history"].pop(0)
+                sensor_data["lux_history"].pop(0)
+                sensor_data["time_history"].pop(0)
 
             # Reset logic
             if touch:
-                state.alarm_active = False
-                state.removal_warning = False
-                state.removal_start_time = None
-                state.alarm_type = None
+                sensor_data["alarm"] = False
+                sensor_data["warning"] = False
+                sensor_data["alarm_type"] = None
+                removal_start = None
 
             # Safety Logic
-            if not state.alarm_active:
-                # Fall Detection
+            if not sensor_data["alarm"]:
                 if accel > FALL_THRESHOLD:
-                    state.alarm_active = True
-                    state.alarm_type = 'Fall'
-                    log_incident('Fall', accel)
-                
-                # Removal Detection
+                    sensor_data["alarm"] = True
+                    sensor_data["alarm_type"] = "Fall"
+                    log_incident("Fall", accel)
                 elif lux > LUX_THRESHOLD:
-                    if not state.removal_warning:
-                        state.removal_warning = True
-                        state.removal_start_time = now
-                    elif now - state.removal_start_time > REMOVAL_DELAY:
+                    if not sensor_data["warning"]:
+                        sensor_data["warning"] = True
+                        removal_start = time.time()
+                    elif time.time() - removal_start > REMOVAL_DELAY:
                         if not touch:
-                            state.alarm_active = True
-                            state.alarm_type = 'Removal'
-                            log_incident('Removal', lux)
+                            sensor_data["alarm"] = True
+                            sensor_data["alarm_type"] = "Removal"
+                            log_incident("Removal", lux)
                 else:
-                    state.removal_warning = False
-                    state.removal_start_time = None
+                    sensor_data["warning"] = False
+                    removal_start = None
 
         # Hardware Feedback
-        if state.alarm_active:
+        if sensor_data["alarm"]:
             led_green.off()
-            if state.alarm_type == 'Fall':
-                led_red.on()
-                # Continuous Siren
+            led_red.on()
+            if sensor_data["alarm_type"] == "Fall":
                 buzzer.play(Tone(1000))
-            else: # Removal Alarm
-                led_red.on()
-                # Pulsing Siren
-                if int(time.time() * 4) % 2:
-                    buzzer.play(Tone(880))
-                else:
-                    buzzer.play(Tone(440))
-        elif state.removal_warning:
-            led_green.off()
-            # Blink Red LED at 2Hz
-            if int(time.time() * 4) % 2:
-                led_red.on()
             else:
-                led_red.off()
+                freq = 880 if int(time.time() * 4) % 2 else 440
+                buzzer.play(Tone(freq))
+        elif sensor_data["warning"]:
+            led_green.off()
+            if int(time.time() * 4) % 2: led_red.on()
+            else: led_red.off()
             buzzer.stop()
         else:
             led_green.on()
@@ -177,10 +158,30 @@ def sensor_loop():
             
         time.sleep(0.1)
 
-# --- Web Interface (Dash + Flask) ---
+# --- Flask & Dash Server ---
 server = Flask(__name__)
 app = Dash(__name__, server=server, url_base_pathname='/dashboard/')
 
+# Requirement: /data route for lightweight JSON
+@server.route('/data')
+def get_sensor_data():
+    with data_lock:
+        # Return only the latest snapshot (excluding heavy history)
+        return jsonify({
+            "lux": sensor_data["lux"],
+            "accel": sensor_data["accel"],
+            "alarm": sensor_data["alarm"],
+            "alarm_type": sensor_data["alarm_type"],
+            "warning": sensor_data["warning"],
+            "touch": sensor_data["touch"],
+            "timestamp": sensor_data["timestamp"]
+        })
+
+@server.route('/')
+def index():
+    return render_template('index.html')
+
+# Dash Layout & Callbacks
 app.layout = html.Div(id='main-container', style={'padding': '20px', 'transition': 'background-color 0.5s'}, children=[
     html.H1("Smart Helmet Control Center", style={'textAlign': 'center', 'color': '#2c3e50'}),
     html.Div(id='status-indicator', style={'textAlign': 'center', 'fontSize': '24px', 'marginBottom': '20px', 'fontWeight': 'bold'}),
@@ -207,59 +208,48 @@ app.layout = html.Div(id='main-container', style={'padding': '20px', 'transition
     [Input('interval-component', 'n_intervals')]
 )
 def update_dashboard(n):
-    with state.lock:
-        timestamps = list(state.timestamps)
-        accel_data = list(state.accel_history)
-        lux_data = list(state.lux_history)
-        is_alarm = state.alarm_active
-        alarm_type = state.alarm_type
-        is_warning = state.removal_warning
+    with data_lock:
+        time_hist = list(sensor_data["time_history"])
+        accel_hist = list(sensor_data["accel_history"])
+        lux_hist = list(sensor_data["lux_history"])
+        is_alarm = sensor_data["alarm"]
+        alarm_type = sensor_data["alarm_type"]
+        is_warning = sensor_data["warning"]
 
-    # Accel Figure
-    fig_accel = go.Figure(data=[go.Scatter(x=timestamps, y=accel_data, mode='lines', name='G-Force', line=dict(color='#e74c3c', width=3))])
+    fig_accel = go.Figure(data=[go.Scatter(x=time_hist, y=accel_hist, mode='lines', name='G-Force', line=dict(color='#e74c3c', width=3))])
     fig_accel.update_layout(title='Real-time Acceleration (g)', xaxis_title='Time', yaxis_title='g', height=400)
 
-    # Lux Figure
-    fig_lux = go.Figure(data=[go.Scatter(x=timestamps, y=lux_data, mode='lines', name='Light Level', line=dict(color='#f1c40f', width=3))])
+    fig_lux = go.Figure(data=[go.Scatter(x=time_hist, y=lux_hist, mode='lines', name='Light Level', line=dict(color='#f1c40f', width=3))])
     fig_lux.update_layout(title='Real-time Light Levels (Lux)', xaxis_title='Time', yaxis_title='Lux', height=400)
 
-    # Incident Table
+    # Incident Table (Pandas)
     table_content = "No incidents logged yet."
     if os.path.exists(HISTORY_FILE):
         try:
             df = pd.read_csv(HISTORY_FILE)
             if not df.empty:
-                last_incidents = df.tail(5).iloc[::-1] # Last 5, reversed
+                last_incidents = df.tail(5).iloc[::-1]
                 table_content = html.Table([
                     html.Thead(html.Tr([html.Th(col) for col in df.columns])),
-                    html.Tbody([
-                        html.Tr([html.Td(last_incidents.iloc[i][col]) for col in df.columns])
-                        for i in range(len(last_incidents))
-                    ])
+                    html.Tbody([html.Tr([html.Td(last_incidents.iloc[i][col]) for col in df.columns]) for i in range(len(last_incidents))])
                 ], style={'width': '100%', 'borderCollapse': 'collapse', 'textAlign': 'left'})
-        except Exception as e:
-            table_content = f"Error reading log: {e}"
+        except: pass
 
-    # Styling
     bg_color = '#ffcccc' if is_alarm else ('#fff3cd' if is_warning else '#ccffcc')
     container_style = {'padding': '20px', 'transition': 'background-color 0.5s', 'backgroundColor': bg_color, 'minHeight': '100vh'}
     
     status_text = "STATUS: SAFE"
-    if is_alarm:
-        status_text = f"STATUS: ALARM ({alarm_type.upper()} DETECTED!)"
-    elif is_warning:
-        status_text = "STATUS: WARNING (HELMET REMOVAL DETECTED)"
+    if is_alarm: status_text = f"STATUS: ALARM ({alarm_type.upper()} DETECTED!)"
+    elif is_warning: status_text = "STATUS: WARNING (HELMET REMOVAL DETECTED)"
 
     return fig_accel, fig_lux, container_style, status_text, table_content
 
-@server.route('/')
-def index():
-    return render_template('index.html')
-
+# --- Main Entry Point (Requirement: Daemon Thread & Host Config) ---
 if __name__ == '__main__':
-    # Start background thread
+    # Start the sensor loop as a background daemon thread
     t = threading.Thread(target=sensor_loop, daemon=True)
     t.start()
     
-    # Run server
-    server.run(host='0.0.0.0', port=5000)
+    # Run the Flask server with specific requirements
+    # host='0.0.0.0' for external access, threaded=True for handling multiple requests
+    server.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
