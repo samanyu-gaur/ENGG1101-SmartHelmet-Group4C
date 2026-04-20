@@ -1,3 +1,7 @@
 smbus2
 gpiozero
 numpy
+pandas
+flask
+dash
+plotly

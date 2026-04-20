@@ -1,191 +1,265 @@
 import time
+import threading
+import csv
+import os
 import math
-import smbus2
-import numpy as np
-from gpiozero import Button, LED, TonalBuzzer
+import pandas as pd
+from datetime import datetime
+from flask import Flask
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
+import plotly.graph_objs as go
+from gpiozero import TonalBuzzer, LED, Button
 from gpiozero.tones import Tone
+from smbus2 import SMBus
 
-class SmartHelmet:
-    # I2C Addresses
-    MPU_ADDR, BH_ADDR = 0x68, 0x23
-    
-    # GPIO Pins (BCM)
-    BUZZER_PIN = 12 # Passive Buzzer (PWM)
-    RED_LED_PIN = 27
-    GREEN_LED_PIN = 17
-    TOUCH_PIN = 24
-    
-    # Thresholds
-    LUX_THRESH = 50 # v2.7 Update
-    REMOVAL_DELAY = 2.0
-    FREEFALL_THRESH, IMPACT_THRESH = 0.5, 3.0
-    STATIONARY_VAR_THRESH = 0.05
-    SOS_HOLD_TIME = 3.0
-    STAGNANT_LIMIT = 20
+# --- Configuration ---
+I2C_BUS = 1
+MPU_ADDR = 0x68
+BH_ADDR = 0x23
+BUZZER_PIN = 12
+RED_LED_PIN = 27
+GREEN_LED_PIN = 17
+TOUCH_PIN = 24
 
-    def __init__(self, bus_num=1):
-        self.bus_num = bus_num
-        self.bus = None
-        self.init_bus()
+LUX_THRESHOLD = 50
+FALL_THRESHOLD = 3.0
+REMOVAL_DELAY = 5.0
+HISTORY_FILE = 'helmet_history.csv'
+
+# --- Global State ---
+class HelmetState:
+    def __init__(self):
+        self.lux = 0.0
+        self.accel_total = 1.0
+        self.alarm_active = False
+        self.alarm_type = None  # 'Fall' or 'Removal'
+        self.removal_warning = False
+        self.removal_start_time = None
+        self.touch_pressed = False
+        self.lock = threading.Lock()
         
-        # Initialize gpiozero components
-        self.touch_sensor = Button(self.TOUCH_PIN, pull_up=False)
-        self.red_led = LED(self.RED_LED_PIN)
-        self.green_led = LED(self.GREEN_LED_PIN)
-        
-        # Passive Buzzer initialization (TonalBuzzer for frequency control)
-        try:
-            self.buzzer = TonalBuzzer(self.BUZZER_PIN)
-        except Exception as e:
-            print(f"Buzzer Init Error: {e}. Falling back to standard output.")
-            self.buzzer = None
+        # History for charts
+        self.accel_history = []
+        self.lux_history = []
+        self.timestamps = []
+        self.max_points = 50
 
-        # State Tracking
-        self.last_lux = -1
-        self.stagnant_count = 0
-        self.removal_start = None
-        self.is_fall_alarm = False
-        self.is_sos_alarm = False
-        self.is_removal_alarm = False
-        
-        self.setup_sensors()
-        
-        # Event-driven Reset
-        self.touch_sensor.when_pressed = self.reset_from_touch
+state = HelmetState()
 
-    def init_bus(self):
-        try:
-            if self.bus: self.bus.close()
-            self.bus = smbus2.SMBus(self.bus_num)
-        except Exception as e:
-            print(f"I2C Bus Error: {e}")
+# --- Hardware Initialization ---
+bus = SMBus(I2C_BUS)
+buzzer = TonalBuzzer(BUZZER_PIN)
+led_red = LED(RED_LED_PIN)
+led_green = LED(GREEN_LED_PIN)
+touch_sensor = Button(TOUCH_PIN, pull_up=False)
 
-    def setup_sensors(self):
-        """v2.7 Initialization with Mode 2 and stabilization."""
-        try:
-            self.bus.write_byte_data(self.MPU_ADDR, 0x6B, 0) # Wake MPU
-            self.bus.write_byte(self.BH_ADDR, 0x01) # Power On BH
-            time.sleep(0.18)
-            self.bus.write_byte(self.BH_ADDR, 0x07) # Reset BH
-            time.sleep(0.05)
-            self.bus.write_byte(self.BH_ADDR, 0x11) # Mode 2
-            time.sleep(0.1)
-        except:
-            self.init_bus()
-
-    def get_lux(self):
-        """Read lux with stagnation check."""
-        try:
-            self.bus.write_byte(self.BH_ADDR, 0x11)
-            time.sleep(0.2)
-            data = self.bus.read_i2c_block_data(self.BH_ADDR, 0x11, 2)
-            lux = ((data[0] << 8) | data[1]) / 1.2
-            
-            if lux == self.last_lux: self.stagnant_count += 1
-            else: self.stagnant_count = 0; self.last_lux = lux
-            
-            if self.stagnant_count >= self.STAGNANT_LIMIT:
-                self.bus.write_byte(self.BH_ADDR, 0x11)
-                self.stagnant_count = 0
-            return lux
-        except: return self.last_lux if self.last_lux != -1 else 0
-
-    def get_accel(self):
-        try:
-            d = self.bus.read_i2c_block_data(self.MPU_ADDR, 0x3B, 6)
-            def rw(h, l):
-                v = (h << 8) + l
-                return v - 65536 if v >= 0x8000 else v
-            return rw(d[0], d[1])/16384.0, rw(d[2], d[3])/16384.0, rw(d[4], d[5])/16384.0
-        except: return 0, 0, 0
-
-    def reset_from_touch(self):
-        if self.is_fall_alarm or self.is_sos_alarm or self.is_removal_alarm:
-            print("\n[RESET] Touch detected. Returning to NORMAL state.")
-            self.reset_alarms()
-
-    def reset_alarms(self):
-        self.is_fall_alarm = self.is_sos_alarm = self.is_removal_alarm = False
-        self.removal_start = None
-        if self.buzzer: self.buzzer.stop()
-        self.red_led.off()
-        self.green_led.on()
-
-    def update_indicators(self):
-        """v2.7 RGB LED and Passive Buzzer logic."""
-        t = time.time()
-        
-        # 1. CRITICAL STATE (Fall / SOS)
-        if self.is_fall_alarm or self.is_sos_alarm:
-            self.green_led.off()
-            self.red_led.on()
-            if self.buzzer:
-                # Siren effect: Alternate between 880Hz and 1000Hz
-                freq = 880 if int(t * 5) % 2 else 1000
-                self.buzzer.play(Tone(freq))
-        
-        # 2. WARNING STATE (Helmet Removed)
-        elif self.is_removal_alarm:
-            self.green_led.off()
-            # Blinking Red
-            self.red_led.value = int(t * 2) % 2
-            if self.buzzer:
-                # Slow chirp: 440Hz pulse
-                if int(t * 2) % 2:
-                    self.buzzer.play(Tone(440))
-                else:
-                    self.buzzer.stop()
-        
-        # 3. NORMAL STATE
-        else:
-            self.red_led.off()
-            self.green_led.on()
-            if self.buzzer: self.buzzer.stop()
-
-    def run_iteration(self):
-        lux = self.get_lux()
-        ax, ay, az = self.get_accel()
-        at = math.sqrt(ax**2 + ay**2 + az**2)
-        
-        # Logic: Removal
-        if lux > self.LUX_THRESH:
-            if not self.removal_start: self.removal_start = time.time()
-            elif time.time() - self.removal_start > self.REMOVAL_DELAY:
-                self.is_removal_alarm = True
-        else:
-            self.removal_start = None
-            if not (self.is_fall_alarm or self.is_sos_alarm): self.is_removal_alarm = False
-
-        # Logic: Fall Detection
-        if at < self.FREEFALL_THRESH and not self.is_fall_alarm:
-            time.sleep(0.05)
-            ix, iy, iz = self.get_accel()
-            it = math.sqrt(ix**2 + iy**2 + iz**2)
-            if it > self.IMPACT_THRESH:
-                print(f"\n[FALL] Impact {it:.2f}g. Checking immobility...")
-                time.sleep(3)
-                samples = [math.sqrt(sum(x**2 for x in self.get_accel())) for _ in range(10)]
-                if np.var(samples) < self.STATIONARY_VAR_THRESH:
-                    self.is_fall_alarm = True
-
-        self.update_indicators()
-        
-        state = "SAFE" if not (self.is_fall_alarm or self.is_removal_alarm or self.is_sos_alarm) else "ALARM"
-        print(f"[{state}] Lux: {lux:6.1f} | G: {at:4.2f} | Touch: {int(self.touch_sensor.value)}", end='\r')
-
-def main():
-    print("--- Smart Helmet v2.7 (RGB & Passive Buzzer Fix) ---")
-    helmet = SmartHelmet()
-    print("System Online. Press Ctrl+C to exit.")
+def setup_sensors():
     try:
-        while True:
-            start = time.time()
-            helmet.run_iteration()
-            elapsed = time.time() - start
-            time.sleep(max(0, 0.02 - elapsed))
-    except KeyboardInterrupt:
-        print("\nShutdown.")
-    finally:
-        helmet.reset_alarms()
+        # Wake up MPU6050
+        bus.write_byte_data(MPU_ADDR, 0x6B, 0x00)
+        # BH1750 Power On and Continuous High Res Mode
+        bus.write_byte(BH_ADDR, 0x01) # Power On
+        time.sleep(0.1)
+        bus.write_byte(BH_ADDR, 0x10) # Continuous High Res Mode
+    except Exception as e:
+        print(f"Sensor Init Error: {e}")
 
-if __name__ == "__main__": main()
+def get_lux():
+    try:
+        data = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
+        return ((data[0] << 8) | data[1]) / 1.2
+    except:
+        return 0.0
+
+def get_accel():
+    try:
+        data = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 6)
+        def read_word(h, l):
+            val = (h << 8) | l
+            return val - 65536 if val >= 32768 else val
+        ax = read_word(data[0], data[1]) / 16384.0
+        ay = read_word(data[2], data[3]) / 16384.0
+        az = read_word(data[4], data[5]) / 16384.0
+        return math.sqrt(ax**2 + ay**2 + az**2)
+    except:
+        return 1.0
+
+def log_incident(type, value):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    file_exists = os.path.isfile(HISTORY_FILE)
+    with open(HISTORY_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Timestamp', 'Alarm Type', 'Sensor Value'])
+        writer.writerow([now, type, f"{value:.2f}"])
+
+# --- Background Logic ---
+def sensor_loop():
+    global state
+    setup_sensors()
+    
+    while True:
+        lux = get_lux()
+        accel = get_accel()
+        touch = touch_sensor.is_pressed
+        now = time.time()
+        
+        with state.lock:
+            state.lux = lux
+            state.accel_total = accel
+            state.touch_pressed = touch
+            
+            # Update history
+            state.timestamps.append(datetime.now().strftime("%H:%M:%S"))
+            state.accel_history.append(accel)
+            state.lux_history.append(lux)
+            if len(state.accel_history) > state.max_points:
+                state.accel_history.pop(0)
+                state.lux_history.pop(0)
+                state.timestamps.pop(0)
+
+            # Reset logic
+            if touch:
+                state.alarm_active = False
+                state.removal_warning = False
+                state.removal_start_time = None
+                state.alarm_type = None
+
+            # Safety Logic
+            if not state.alarm_active:
+                # Fall Detection
+                if accel > FALL_THRESHOLD:
+                    state.alarm_active = True
+                    state.alarm_type = 'Fall'
+                    log_incident('Fall', accel)
+                
+                # Removal Detection
+                elif lux > LUX_THRESHOLD:
+                    if not state.removal_warning:
+                        state.removal_warning = True
+                        state.removal_start_time = now
+                    elif now - state.removal_start_time > REMOVAL_DELAY:
+                        if not touch:
+                            state.alarm_active = True
+                            state.alarm_type = 'Removal'
+                            log_incident('Removal', lux)
+                else:
+                    state.removal_warning = False
+                    state.removal_start_time = None
+
+        # Hardware Feedback
+        if state.alarm_active:
+            led_green.off()
+            if state.alarm_type == 'Fall':
+                led_red.on()
+                # Continuous Siren
+                buzzer.play(Tone(1000))
+            else: # Removal Alarm
+                led_red.on()
+                # Pulsing Siren
+                if int(time.time() * 4) % 2:
+                    buzzer.play(Tone(880))
+                else:
+                    buzzer.play(Tone(440))
+        elif state.removal_warning:
+            led_green.off()
+            # Blink Red LED at 2Hz
+            if int(time.time() * 4) % 2:
+                led_red.on()
+            else:
+                led_red.off()
+            buzzer.stop()
+        else:
+            led_green.on()
+            led_red.off()
+            buzzer.stop()
+            
+        time.sleep(0.1)
+
+# --- Web Interface (Dash + Flask) ---
+server = Flask(__name__)
+app = Dash(__name__, server=server, url_base_pathname='/dashboard/')
+
+app.layout = html.Div(id='main-container', style={'padding': '20px', 'transition': 'background-color 0.5s'}, children=[
+    html.H1("Smart Helmet Control Center", style={'textAlign': 'center', 'color': '#2c3e50'}),
+    html.Div(id='status-indicator', style={'textAlign': 'center', 'fontSize': '24px', 'marginBottom': '20px', 'fontWeight': 'bold'}),
+    
+    html.Div(style={'display': 'flex', 'flexWrap': 'wrap'}, children=[
+        html.Div(style={'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(id='accel-graph')]),
+        html.Div(style={'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(id='lux-graph')])
+    ]),
+    
+    html.Div(style={'marginTop': '40px'}, children=[
+        html.H3("Recent Incident Log (CSV)"),
+        html.Div(id='incident-table')
+    ]),
+    
+    dcc.Interval(id='interval-component', interval=1000, n_intervals=0)
+])
+
+@app.callback(
+    [Output('accel-graph', 'figure'),
+     Output('lux-graph', 'figure'),
+     Output('main-container', 'style'),
+     Output('status-indicator', 'children'),
+     Output('incident-table', 'children')],
+    [Input('interval-component', 'n_intervals')]
+)
+def update_dashboard(n):
+    with state.lock:
+        timestamps = list(state.timestamps)
+        accel_data = list(state.accel_history)
+        lux_data = list(state.lux_history)
+        is_alarm = state.alarm_active
+        alarm_type = state.alarm_type
+        is_warning = state.removal_warning
+
+    # Accel Figure
+    fig_accel = go.Figure(data=[go.Scatter(x=timestamps, y=accel_data, mode='lines', name='G-Force', line=dict(color='#e74c3c', width=3))])
+    fig_accel.update_layout(title='Real-time Acceleration (g)', xaxis_title='Time', yaxis_title='g', height=400)
+
+    # Lux Figure
+    fig_lux = go.Figure(data=[go.Scatter(x=timestamps, y=lux_data, mode='lines', name='Light Level', line=dict(color='#f1c40f', width=3))])
+    fig_lux.update_layout(title='Real-time Light Levels (Lux)', xaxis_title='Time', yaxis_title='Lux', height=400)
+
+    # Incident Table
+    table_content = "No incidents logged yet."
+    if os.path.exists(HISTORY_FILE):
+        try:
+            df = pd.read_csv(HISTORY_FILE)
+            if not df.empty:
+                last_incidents = df.tail(5).iloc[::-1] # Last 5, reversed
+                table_content = html.Table([
+                    html.Thead(html.Tr([html.Th(col) for col in df.columns])),
+                    html.Tbody([
+                        html.Tr([html.Td(last_incidents.iloc[i][col]) for col in df.columns])
+                        for i in range(len(last_incidents))
+                    ])
+                ], style={'width': '100%', 'borderCollapse': 'collapse', 'textAlign': 'left'})
+        except Exception as e:
+            table_content = f"Error reading log: {e}"
+
+    # Styling
+    bg_color = '#ffcccc' if is_alarm else ('#fff3cd' if is_warning else '#ccffcc')
+    container_style = {'padding': '20px', 'transition': 'background-color 0.5s', 'backgroundColor': bg_color, 'minHeight': '100vh'}
+    
+    status_text = "STATUS: SAFE"
+    if is_alarm:
+        status_text = f"STATUS: ALARM ({alarm_type.upper()} DETECTED!)"
+    elif is_warning:
+        status_text = "STATUS: WARNING (HELMET REMOVAL DETECTED)"
+
+    return fig_accel, fig_lux, container_style, status_text, table_content
+
+@server.route('/')
+def index():
+    return render_template('index.html')
+
+if __name__ == '__main__':
+    # Start background thread
+    t = threading.Thread(target=sensor_loop, daemon=True)
+    t.start()
+    
+    # Run server
+    server.run(host='0.0.0.0', port=5000)
