@@ -11,12 +11,13 @@ ADDR_BH = 0x23
 ADDR_MPU = 0x68
 
 PIN_BUZZER = 12
-PIN_LED_RED = 27
-PIN_LED_GRN = 17
+PIN_LED_RED = 17
+PIN_LED_GRN = 27
+PIN_LED_BLU = 22
 PIN_TOUCH = 24
 
 THRESH_LUX = 150    # REQUIREMENT: Lux > 150 for removal
-THRESH_FALL = 3.0   # REQUIREMENT: G-Force > 3.0g
+THRESH_FALL = 2.5   # REQUIREMENT: G-Force > 3.0g
 DELAY_REMOVAL = 5.0
 
 # --- ANSI UI Codes ---
@@ -59,7 +60,19 @@ def init_hw():
 buzzer = PWMOutputDevice(PIN_BUZZER)
 led_red = LED(PIN_LED_RED)
 led_green = LED(PIN_LED_GRN)
+led_blue = LED(PIN_LED_BLU)
 touch_sensor = Button(PIN_TOUCH, pull_up=False)
+
+
+def set_leds(r, g, b):
+    """便捷控制LED组合"""
+    if r: led_red.on() 
+    else: led_red.off()
+    if g: led_green.on() 
+    else: led_green.off()
+    if b: led_blue.on() 
+    else: led_blue.off()
+
 
 def get_sensors():
     """Robust sensor polling with i2c_msg for BH1750 consistency."""
@@ -163,17 +176,31 @@ def main():
 
             # --- Hardware Drive ---
             if state["alarm"]:
+                # 状态1：紧急警报 (红灯闪烁 + 高频变调)
                 led_green.off()
-                led_red.on()
-                # Pulsing Siren
-                buzzer.value = 0.5 if int(time.time() * 8) % 2 else 0
+                led_blue.off()
+                led_red.value = int(time.time() * 10) % 2  # 极快闪烁
+                
+                # 蜂鸣器：高频变调 (880Hz - 1200Hz 循环)
+                freq = 880 + (math.sin(time.time() * 10) * 200)
+                buzzer.frequency = freq
+                buzzer.value = 0.5 
+
             elif state["lux"] > THRESH_LUX:
+                # 状态2：移除警告 (蓝灯闪烁 + 低频间歇音)
                 led_green.off()
-                led_red.value = int(time.time() * 4) % 2 # Blinking warning
-                buzzer.off()
+                led_red.off()
+                led_blue.value = int(time.time() * 2) % 2 # 慢闪
+                
+                # 蜂鸣器：440Hz 间歇短促音
+                buzzer.frequency = 440
+                buzzer.value = 0.2 if int(time.time() * 4) % 2 else 0
+                
             else:
+                # 状态3：正常运行 (常亮绿灯)
                 led_green.on()
                 led_red.off()
+                led_blue.off()
                 buzzer.off()
 
             render_ui()
