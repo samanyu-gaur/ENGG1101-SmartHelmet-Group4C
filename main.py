@@ -1,14 +1,10 @@
 import time
 import threading
-import csv
-import os
+import json
 import math
-import pandas as pd
+import os
 from datetime import datetime
-from flask import Flask, render_template, jsonify
-from dash import Dash, dcc, html
-from dash.dependencies import Input, Output
-import plotly.graph_objs as go
+from flask import Flask, render_template_string, jsonify
 from gpiozero import TonalBuzzer, LED, Button
 from gpiozero.tones import Tone
 from smbus2 import SMBus
@@ -23,42 +19,36 @@ GREEN_LED_PIN = 17
 TOUCH_PIN = 24
 
 LUX_THRESHOLD = 50
-FALL_THRESHOLD = 3.0
 REMOVAL_DELAY = 5.0
-HISTORY_FILE = 'helmet_history.csv'
+FALL_THRESHOLD = 3.0
 
-# --- Global State (Requirement: sensor_data dictionary) ---
+# --- Global State ---
 sensor_data = {
     "lux": 0.0,
     "accel": 1.0,
     "alarm": False,
-    "alarm_type": None,
     "warning": False,
-    "touch": False,
-    "timestamp": "",
-    "accel_history": [],
-    "lux_history": [],
-    "time_history": []
+    "status": "Safe",
+    "timestamp": ""
 }
 data_lock = threading.Lock()
-MAX_HISTORY = 50
 
-# --- Hardware Initialization ---
-bus = SMBus(I2C_BUS)
+# --- Hardware Setup ---
+try:
+    bus = SMBus(I2C_BUS)
+    bus.write_byte_data(MPU_ADDR, 0x6B, 0x00) # Wake MPU
+    bus.write_byte(BH_ADDR, 0x01) # Power On BH
+    time.sleep(0.1)
+    bus.write_byte(BH_ADDR, 0x10) # Continuous High Res
+except Exception as e:
+    print(f"Hardware Init Error: {e}")
+
 buzzer = TonalBuzzer(BUZZER_PIN)
 led_red = LED(RED_LED_PIN)
 led_green = LED(GREEN_LED_PIN)
 touch_sensor = Button(TOUCH_PIN, pull_up=False)
 
-def setup_sensors():
-    try:
-        bus.write_byte_data(MPU_ADDR, 0x6B, 0x00) # Wake MPU
-        bus.write_byte(BH_ADDR, 0x01) # Power On BH
-        time.sleep(0.1)
-        bus.write_byte(BH_ADDR, 0x10) # Continuous High Res Mode
-    except Exception as e:
-        print(f"Sensor Init Error: {e}")
-
+# --- Logic Functions ---
 def get_lux():
     try:
         data = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
@@ -71,81 +61,57 @@ def get_accel():
         def read_word(h, l):
             val = (h << 8) | l
             return val - 65536 if val >= 32768 else val
-        ax, ay, az = read_word(data[0], data[1])/16384.0, read_word(data[2], data[3])/16384.0, read_word(data[4], data[5])/16384.0
+        ax = read_word(data[0], data[1]) / 16384.0
+        ay = read_word(data[2], data[3]) / 16384.0
+        az = read_word(data[4], data[5]) / 16384.0
         return math.sqrt(ax**2 + ay**2 + az**2)
     except: return 1.0
 
-def log_incident(type, value):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    file_exists = os.path.isfile(HISTORY_FILE)
-    with open(HISTORY_FILE, 'a', newline='') as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(['Timestamp', 'Alarm Type', 'Sensor Value'])
-        writer.writerow([now, type, f"{value:.2f}"])
-
-# --- Background Thread (Requirement: sensor_loop) ---
 def sensor_loop():
     global sensor_data
-    setup_sensors()
-    removal_start = None
+    warning_start = None
     
     while True:
         lux = get_lux()
         accel = get_accel()
         touch = touch_sensor.is_pressed
-        now_ts = datetime.now().strftime("%H:%M:%S")
         
         with data_lock:
-            sensor_data["lux"] = lux
-            sensor_data["accel"] = accel
-            sensor_data["touch"] = touch
-            sensor_data["timestamp"] = now_ts
-            
-            # History management
-            sensor_data["accel_history"].append(accel)
-            sensor_data["lux_history"].append(lux)
-            sensor_data["time_history"].append(now_ts)
-            if len(sensor_data["accel_history"]) > MAX_HISTORY:
-                sensor_data["accel_history"].pop(0)
-                sensor_data["lux_history"].pop(0)
-                sensor_data["time_history"].pop(0)
+            sensor_data["lux"] = round(lux, 2)
+            sensor_data["accel"] = round(accel, 2)
+            sensor_data["timestamp"] = datetime.now().strftime("%H:%M:%S")
 
-            # Reset logic
+            # 1. Reset Logic
             if touch:
                 sensor_data["alarm"] = False
                 sensor_data["warning"] = False
-                sensor_data["alarm_type"] = None
-                removal_start = None
+                sensor_data["status"] = "Safe"
+                warning_start = None
 
-            # Safety Logic
+            # 2. Safety Logic (The 5-Second Rule)
             if not sensor_data["alarm"]:
                 if accel > FALL_THRESHOLD:
                     sensor_data["alarm"] = True
-                    sensor_data["alarm_type"] = "Fall"
-                    log_incident("Fall", accel)
+                    sensor_data["status"] = "Fall Detected"
                 elif lux > LUX_THRESHOLD:
                     if not sensor_data["warning"]:
                         sensor_data["warning"] = True
-                        removal_start = time.time()
-                    elif time.time() - removal_start > REMOVAL_DELAY:
-                        if not touch:
+                        sensor_data["status"] = "Removal Warning"
+                        warning_start = time.time()
+                    elif time.time() - warning_start > REMOVAL_DELAY:
+                        if not touch: # Trigger if not pressed by 5s
                             sensor_data["alarm"] = True
-                            sensor_data["alarm_type"] = "Removal"
-                            log_incident("Removal", lux)
+                            sensor_data["status"] = "Helmet Removed"
                 else:
                     sensor_data["warning"] = False
-                    removal_start = None
+                    if not sensor_data["alarm"]: sensor_data["status"] = "Safe"
+                    warning_start = None
 
-        # Hardware Feedback
+        # 3. Hardware Feedback
         if sensor_data["alarm"]:
             led_green.off()
             led_red.on()
-            if sensor_data["alarm_type"] == "Fall":
-                buzzer.play(Tone(1000))
-            else:
-                freq = 880 if int(time.time() * 4) % 2 else 440
-                buzzer.play(Tone(freq))
+            buzzer.play(Tone(1000))
         elif sensor_data["warning"]:
             led_green.off()
             if int(time.time() * 4) % 2: led_red.on()
@@ -155,101 +121,142 @@ def sensor_loop():
             led_green.on()
             led_red.off()
             buzzer.stop()
+
+        time.sleep(0.05) # Prevent CPU Maxing
+
+# --- Web Server ---
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Helmet Final Demo</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #121212; color: #e0e0e0; font-family: 'Inter', sans-serif; }
+        .card { background-color: #1e1e1e; border: none; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        .status-safe { color: #00e676; }
+        .status-warning { color: #ffea00; }
+        .status-alarm { color: #ff1744; }
+        .display-1 { font-weight: 700; }
+    </style>
+</head>
+<body>
+    <div class="container py-5">
+        <div class="row mb-4">
+            <div class="col-12 text-center">
+                <h1 class="display-4 mb-2">Showstopper Control Center</h1>
+                <p class="lead text-muted">Final Demo - Raspberry Pi 5 Elite Version</p>
+            </div>
+        </div>
+
+        <div class="row g-4">
+            <!-- Main Status Card -->
+            <div class="col-lg-6">
+                <div class="card p-4 h-100">
+                    <h3>System Status</h3>
+                    <div id="status-box" class="display-1 text-center my-4 status-safe">SAFE</div>
+                    <div class="row text-center mt-3">
+                        <div class="col-6">
+                            <h5>Light Level</h5>
+                            <p id="lux-val" class="h2">0.0 Lux</p>
+                        </div>
+                        <div class="col-6">
+                            <h5>G-Force</h5>
+                            <p id="accel-val" class="h2">1.0 g</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Graph Card -->
+            <div class="col-lg-6">
+                <div class="card p-4 h-100">
+                    <h3>Real-time Telemetry</h3>
+                    <canvas id="telemetryChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const ctx = document.getElementById('telemetryChart').getContext('2d');
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'G-Force (g)',
+                    borderColor: '#ff1744',
+                    data: [],
+                    fill: false,
+                    tension: 0.4
+                }, {
+                    label: 'Light (Lux/100)',
+                    borderColor: '#00e676',
+                    data: [],
+                    fill: false,
+                    tension: 0.4
+                }]
+            },
+            options: {
+                responsive: true,
+                scales: {
+                    x: { ticks: { color: '#888' } },
+                    y: { ticks: { color: '#888' }, beginAtZero: true }
+                },
+                plugins: { legend: { labels: { color: '#e0e0e0' } } }
+            }
+        });
+
+        async function updateData() {
+            const response = await fetch('/data');
+            const data = await response.json();
             
-        time.sleep(0.1)
+            // Update UI
+            const statusBox = document.getElementById('status-box');
+            statusBox.innerText = data.status.toUpperCase();
+            statusBox.className = 'display-1 text-center my-4 ' + 
+                (data.alarm ? 'status-alarm' : (data.warning ? 'status-warning' : 'status-safe'));
+            
+            document.getElementById('lux-val').innerText = data.lux + ' Lux';
+            document.getElementById('accel-val').innerText = data.accel + ' g';
 
-# --- Flask & Dash Server ---
-server = Flask(__name__)
-app = Dash(__name__, server=server, url_base_pathname='/dashboard/')
+            // Update Chart
+            if (chart.data.labels.length > 20) {
+                chart.data.labels.shift();
+                chart.data.datasets[0].data.shift();
+                chart.data.datasets[1].data.shift();
+            }
+            chart.data.labels.push(data.timestamp);
+            chart.data.datasets[0].data.push(data.accel);
+            chart.data.datasets[1].data.push(data.lux / 100);
+            chart.update('none');
+        }
 
-# Requirement: /data route for lightweight JSON
-@server.route('/data')
-def get_sensor_data():
-    with data_lock:
-        # Return only the latest snapshot (excluding heavy history)
-        return jsonify({
-            "lux": sensor_data["lux"],
-            "accel": sensor_data["accel"],
-            "alarm": sensor_data["alarm"],
-            "alarm_type": sensor_data["alarm_type"],
-            "warning": sensor_data["warning"],
-            "touch": sensor_data["touch"],
-            "timestamp": sensor_data["timestamp"]
-        })
+        setInterval(updateData, 500);
+    </script>
+</body>
+</html>
+"""
 
-@server.route('/')
+@app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template_string(HTML_TEMPLATE)
 
-# Dash Layout & Callbacks
-app.layout = html.Div(id='main-container', style={'padding': '20px', 'transition': 'background-color 0.5s'}, children=[
-    html.H1("Smart Helmet Control Center", style={'textAlign': 'center', 'color': '#2c3e50'}),
-    html.Div(id='status-indicator', style={'textAlign': 'center', 'fontSize': '24px', 'marginBottom': '20px', 'fontWeight': 'bold'}),
-    
-    html.Div(style={'display': 'flex', 'flexWrap': 'wrap'}, children=[
-        html.Div(style={'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(id='accel-graph')]),
-        html.Div(style={'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(id='lux-graph')])
-    ]),
-    
-    html.Div(style={'marginTop': '40px'}, children=[
-        html.H3("Recent Incident Log (CSV)"),
-        html.Div(id='incident-table')
-    ]),
-    
-    dcc.Interval(id='interval-component', interval=1000, n_intervals=0)
-])
-
-@app.callback(
-    [Output('accel-graph', 'figure'),
-     Output('lux-graph', 'figure'),
-     Output('main-container', 'style'),
-     Output('status-indicator', 'children'),
-     Output('incident-table', 'children')],
-    [Input('interval-component', 'n_intervals')]
-)
-def update_dashboard(n):
+@app.route('/data')
+def get_data():
     with data_lock:
-        time_hist = list(sensor_data["time_history"])
-        accel_hist = list(sensor_data["accel_history"])
-        lux_hist = list(sensor_data["lux_history"])
-        is_alarm = sensor_data["alarm"]
-        alarm_type = sensor_data["alarm_type"]
-        is_warning = sensor_data["warning"]
+        return jsonify(sensor_data)
 
-    fig_accel = go.Figure(data=[go.Scatter(x=time_hist, y=accel_hist, mode='lines', name='G-Force', line=dict(color='#e74c3c', width=3))])
-    fig_accel.update_layout(title='Real-time Acceleration (g)', xaxis_title='Time', yaxis_title='g', height=400)
-
-    fig_lux = go.Figure(data=[go.Scatter(x=time_hist, y=lux_hist, mode='lines', name='Light Level', line=dict(color='#f1c40f', width=3))])
-    fig_lux.update_layout(title='Real-time Light Levels (Lux)', xaxis_title='Time', yaxis_title='Lux', height=400)
-
-    # Incident Table (Pandas)
-    table_content = "No incidents logged yet."
-    if os.path.exists(HISTORY_FILE):
-        try:
-            df = pd.read_csv(HISTORY_FILE)
-            if not df.empty:
-                last_incidents = df.tail(5).iloc[::-1]
-                table_content = html.Table([
-                    html.Thead(html.Tr([html.Th(col) for col in df.columns])),
-                    html.Tbody([html.Tr([html.Td(last_incidents.iloc[i][col]) for col in df.columns]) for i in range(len(last_incidents))])
-                ], style={'width': '100%', 'borderCollapse': 'collapse', 'textAlign': 'left'})
-        except: pass
-
-    bg_color = '#ffcccc' if is_alarm else ('#fff3cd' if is_warning else '#ccffcc')
-    container_style = {'padding': '20px', 'transition': 'background-color 0.5s', 'backgroundColor': bg_color, 'minHeight': '100vh'}
-    
-    status_text = "STATUS: SAFE"
-    if is_alarm: status_text = f"STATUS: ALARM ({alarm_type.upper()} DETECTED!)"
-    elif is_warning: status_text = "STATUS: WARNING (HELMET REMOVAL DETECTED)"
-
-    return fig_accel, fig_lux, container_style, status_text, table_content
-
-# --- Main Entry Point (Requirement: Daemon Thread & Host Config) ---
-if __name__ == '__main__':
-    # Start the sensor loop as a background daemon thread
+if __name__ == "__main__":
+    # Start sensor thread
     t = threading.Thread(target=sensor_loop, daemon=True)
     t.start()
     
-    # Run the Flask server with specific requirements
-    # host='0.0.0.0' for external access, threaded=True for handling multiple requests
-    server.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    # Run server
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
