@@ -1,17 +1,8 @@
 import time
-import threading
 import math
 import os
-from datetime import datetime
-from gpiozero import PWMOutputDevice, Button
 from smbus2 import SMBus
-from rich.live import Live
-from rich.table import Table
-from rich.layout import Layout
-from rich.panel import Panel
-from rich.console import Console
-from rich import box
-from flask import Flask, jsonify, render_template_string
+from gpiozero import PWMOutputDevice, Button
 
 # --- Configuration ---
 I2C_BUS = 1
@@ -26,190 +17,142 @@ LUX_THRESHOLD = 50
 REMOVAL_DELAY = 5.0
 FALL_THRESHOLD = 3.0
 
-# --- Global State ---
-state = {
-    "lux": 0.0,
-    "accel": 1.0,
-    "alarm": False,
-    "warning": False,
-    "status": "SAFE",
-    "timestamp": "",
-    "cpu_temp": 0.0,
-    "logs": ["System Booting...", "Ready."],
-    "online": True
-}
-data_lock = threading.Lock()
-i2c_lock = threading.Lock()
+# --- ANSI Color Codes ---
+CLR = "\033[H\033[J"
+RED = "\033[91m"
+GRN = "\033[92m"
+YLW = "\033[93m"
+BLU = "\033[94m"
+BLD = "\033[1m"
+RST = "\033[0m"
 
-# --- Hardware Setup ---
+# --- Hardware Initialization ---
+bus = SMBus(I2C_BUS)
+def setup_sensors():
+    try:
+        bus.write_byte_data(MPU_ADDR, 0x6B, 0x00) # Wake MPU
+        bus.write_byte(BH_ADDR, 0x01) # Power BH
+        time.sleep(0.1)
+        bus.write_byte(BH_ADDR, 0x10) # Continuous High Res
+        return True
+    except: return False
+
 buzzer = PWMOutputDevice(BUZZER_PIN)
 led_red = PWMOutputDevice(RED_LED_PIN)
 led_green = PWMOutputDevice(GREEN_LED_PIN)
 touch_sensor = Button(TOUCH_PIN, pull_up=False)
 
-def get_cpu_temp():
+# --- State Variables ---
+alarm_active = False
+warning_active = False
+warning_start_time = None
+status_msg = "SAFE"
+current_lux = 0.0
+current_accel = 1.0
+
+def get_data():
+    global current_lux, current_accel
     try:
-        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-            return float(f.read()) / 1000.0
-    except: return 0.0
+        # Lux
+        l_data = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
+        current_lux = ((l_data[0] << 8) | l_data[1]) / 1.2
+        # Accel
+        a_data = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 6)
+        def rw(h, l):
+            v = (h << 8) | l
+            return v - 65536 if v >= 32768 else v
+        ax = rw(a_data[0], a_data[1]) / 16384.0
+        ay = rw(a_data[2], a_data[3]) / 16384.0
+        az = rw(a_data[4], a_data[5]) / 16384.0
+        current_accel = math.sqrt(ax**2 + ay**2 + az**2)
+    except: pass
 
-def setup_sensors():
-    global bus
-    with i2c_lock:
-        try:
-            bus = SMBus(I2C_BUS)
-            bus.write_byte_data(MPU_ADDR, 0x6B, 0x00)
-            bus.write_byte(BH_ADDR, 0x01)
-            time.sleep(0.1)
-            bus.write_byte(BH_ADDR, 0x10)
-            return True
-        except: return False
-
-def sensor_thread():
-    global state
-    warning_start = None
+def main():
+    global alarm_active, warning_active, warning_start_time, status_msg
     setup_sensors()
     
-    while True:
-        lux, accel, online = 0.0, 1.0, False
-        with i2c_lock:
-            try:
-                # Lux
-                d = bus.read_i2c_block_data(BH_ADDR, 0x10, 2)
-                lux = ((d[0] << 8) | d[1]) / 1.2
-                # Accel
-                d = bus.read_i2c_block_data(MPU_ADDR, 0x3B, 6)
-                def rw(h, l):
-                    v = (h << 8) | l
-                    return v - 65536 if v >= 32768 else v
-                ax, ay, az = rw(d[0], d[1])/16384.0, rw(d[2], d[3])/16384.0, rw(d[4], d[5])/16384.0
-                accel = math.sqrt(ax**2 + ay**2 + az**2)
-                online = True
-            except: pass
-
-        touch = touch_sensor.is_pressed
-        
-        with data_lock:
-            state["lux"] = round(lux, 2)
-            state["accel"] = round(accel, 2)
-            state["cpu_temp"] = round(get_cpu_temp(), 1)
-            state["timestamp"] = datetime.now().strftime("%H:%M:%S")
-            state["online"] = online
-
-            if touch:
-                if state["alarm"] or state["warning"]:
-                    state["logs"].append(f"[{state['timestamp']}] Reset Pressed.")
-                state["alarm"] = False
-                state["warning"] = False
-                state["status"] = "SAFE"
-                warning_start = None
-
-            if not state["alarm"]:
-                if accel > FALL_THRESHOLD:
-                    state["alarm"] = True
-                    state["status"] = "FALL DETECTED"
-                    state["logs"].append(f"[{state['timestamp']}] CRITICAL: Fall Detected ({accel}g)")
-                elif lux > LUX_THRESHOLD:
-                    if not state["warning"]:
-                        state["warning"] = True
-                        state["status"] = "REMOVAL WARNING"
-                        warning_start = time.time()
-                        state["logs"].append(f"[{state['timestamp']}] Warning: Helmet Removed")
-                    elif time.time() - warning_start > REMOVAL_DELAY:
-                        if not touch:
-                            state["alarm"] = True
-                            state["status"] = "ALARM: REMOVAL"
-                            state["logs"].append(f"[{state['timestamp']}] CRITICAL: 5s Timer Expired")
-                else:
-                    state["warning"] = False
-                    if not state["alarm"]: state["status"] = "SAFE"
-                    warning_start = None
-            
-            # Keep logs to last 5
-            if len(state["logs"]) > 5: state["logs"].pop(0)
-
-        # Hardware Feedback
-        if state["alarm"]:
-            led_green.value = 0
-            led_red.value = 1
-            buzzer.value = 0.5
-        elif state["warning"]:
-            led_green.value = 0
-            led_red.value = 1 if int(time.time() * 4) % 2 else 0
-            buzzer.value = 0
-        else:
-            led_green.value = 1
-            led_red.value = 0
-            buzzer.value = 0
-
-        time.sleep(0.05)
-
-# --- Terminal UI Layout ---
-def make_layout() -> Layout:
-    layout = Layout()
-    layout.split(
-        Layout(name="header", size=3),
-        Layout(name="main", size=10),
-        Layout(name="footer", size=8),
-    )
-    return layout
-
-def update_ui(layout: Layout):
-    with data_lock:
-        # Header
-        status_color = "red" if state["alarm"] else ("yellow" if state["warning"] else "green")
-        online_str = "[green]ONLINE[/]" if state["online"] else "[red]OFFLINE[/]"
-        header_table = Table.grid(expand=True)
-        header_table.add_column(justify="left")
-        header_table.add_column(justify="center")
-        header_table.add_column(justify="right")
-        header_table.add_row(
-            f" [b]HELMET STATUS:[/] [{status_color}]{state['status']}[/]",
-            f"[b]CORE TEMP:[/] {state['cpu_temp']}°C",
-            f"{state['timestamp']} | {online_str} "
-        )
-        layout["header"].update(Panel(header_table, style="white on blue", box=box.ROUNDED))
-
-        # Main Table
-        main_table = Table(box=box.MINIMAL_DOUBLE_HEAD, expand=True)
-        main_table.add_column("Sensor", justify="center", style="cyan")
-        main_table.add_column("Current Reading", justify="center", style="magenta")
-        main_table.add_column("Threshold", justify="center", style="white")
-        main_table.add_column("Status", justify="center")
-
-        lux_status = "[red]HIGH[/]" if state["lux"] > LUX_THRESHOLD else "[green]NORMAL[/]"
-        accel_status = "[red]SPIKE[/]" if state["accel"] > FALL_THRESHOLD else "[green]NORMAL[/]"
-
-        main_table.add_row("BH1750 (Lux)", f"{state['lux']} lx", f"> {LUX_THRESHOLD}", lux_status)
-        main_table.add_row("MPU6050 (G)", f"{state['accel']} g", f"> {FALL_THRESHOLD}", accel_status)
-        layout["main"].update(Panel(main_table, title="[b]Live Telemetry[/]", border_style="bright_blue"))
-
-        # Footer / Logs
-        log_content = "\n".join(state["logs"])
-        layout["footer"].update(Panel(log_content, title="[b]Event History[/]", border_style="yellow"))
-
-# --- Flask Server (Background) ---
-app = Flask(__name__)
-@app.route('/data')
-def get_data():
-    with data_lock: return jsonify(state)
-
-def run_flask():
-    app.run(host='0.0.0.0', port=8080, threaded=True, debug=False)
-
-# --- Entry Point ---
-if __name__ == "__main__":
-    # Start Logic & Web
-    t_sensor = threading.Thread(target=sensor_thread, daemon=True)
-    t_sensor.start()
-    
-    t_flask = threading.Thread(target=run_flask, daemon=True)
-    t_flask.start()
-
-    # Launch Terminal UI
-    console = Console()
-    layout = make_layout()
-    with Live(layout, refresh_per_second=10, screen=True) as live:
+    print(CLR, end="")
+    try:
         while True:
-            update_ui(layout)
+            get_data()
+            touch = touch_sensor.is_pressed
+            
+            # --- Safety Logic ---
+            if touch:
+                alarm_active = False
+                warning_active = False
+                warning_start_time = None
+                status_msg = "SAFE"
+
+            if not alarm_active:
+                if current_accel > FALL_THRESHOLD:
+                    alarm_active = True
+                    status_msg = "FALL DETECTED!"
+                elif current_lux > LUX_THRESHOLD:
+                    if not warning_active:
+                        warning_active = True
+                        warning_start_time = time.time()
+                        status_msg = "REMOVAL WARNING"
+                    elif time.time() - warning_start_time > REMOVAL_DELAY:
+                        if not touch:
+                            alarm_active = True
+                            status_msg = "ALARM: HELMET REMOVED"
+                else:
+                    warning_active = False
+                    warning_start_time = None
+                    if not alarm_active: status_msg = "SAFE"
+
+            # --- Hardware Control ---
+            if alarm_active:
+                led_green.value = 0
+                led_red.value = 1
+                buzzer.value = 0.5
+                color = RED
+            elif warning_active:
+                led_green.value = 0
+                led_red.value = 1 if int(time.time() * 4) % 2 else 0
+                buzzer.value = 0
+                color = YLW
+            else:
+                led_green.value = 1
+                led_red.value = 0
+                buzzer.value = 0
+                color = GRN
+
+            # --- Terminal UI ---
+            print(f"{CLR}{BLD}{BLU}========================================{RST}")
+            print(f"{BLD}{BLU}   GROUP 4C: SMART HELMET SYSTEM        {RST}")
+            print(f"{BLD}{BLU}========================================{RST}\n")
+            
+            print(f"{BLD}SYSTEM STATUS:{RST} {color}{BLD}{status_msg}{RST}\n")
+            
+            print(f"{BLD}SENSOR DATA:{RST}")
+            print(f"  - LUX LEVEL:  {current_lux:>7.1f} lx")
+            print(f"  - G-FORCE:    {current_accel:>7.2f} g\n")
+            
+            print(f"{BLD}HARDWARE STATE:{RST}")
+            bz_str = f"{RED}ACTIVE{RST}" if alarm_active else f"{GRN}OFF{RST}"
+            lg_str = f"{GRN}ON{RST}" if not (alarm_active or warning_active) else f"{RED}OFF{RST}"
+            lr_str = f"{RED}ON{RST}" if alarm_active or (warning_active and int(time.time()*4)%2) else f"{GRN}OFF{RST}"
+            
+            print(f"  - BUZZER:     {bz_str}")
+            print(f"  - GREEN LED:  {lg_str}")
+            print(f"  - RED LED:    {lr_str}\n")
+            
+            if warning_active and not alarm_active:
+                rem = max(0, REMOVAL_DELAY - (time.time() - warning_start_time))
+                print(f"{YLW}{BLD}>> TRIGGERING ALARM IN: {rem:.1f}s <<{RST}")
+            elif alarm_active:
+                print(f"{RED}{BLD}>> PRESS TOUCH SENSOR TO RESET <<{RST}")
+            else:
+                print(f"{GRN}SYSTEM OPERATING NORMALLY{RST}")
+
             time.sleep(0.1)
+    except KeyboardInterrupt:
+        led_red.off()
+        led_green.off()
+        buzzer.off()
+        print(f"\n{RST}System Shutdown.")
+
+if __name__ == "__main__":
+    main()
