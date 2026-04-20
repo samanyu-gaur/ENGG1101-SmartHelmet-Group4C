@@ -14,7 +14,7 @@ PIN_BUZZER = 12
 PIN_LED_RED = 27
 PIN_TOUCH = 24
 
-THRESH_LUX = 50
+THRESH_LUX = 30
 THRESH_FALL = 3.0
 DELAY_REMOVAL = 5.0
 
@@ -32,6 +32,7 @@ BYLW = "\033[93m"
 BBLU = "\033[94m"
 BMAG = "\033[95m"
 BCYN = "\033[96m"
+BWHT = "\033[97m"
 
 # --- Globals and Hardware Init ---
 try:
@@ -93,7 +94,7 @@ def pad_banner(text, width=58):
     pad_r = width - len(text) - pad_l
     return " " * pad_l, " " * pad_r
 
-def render_ui(mode, lux, accel, touch, countdown):
+def render_ui(mode, lux, accel, touch, countdown, event_log):
     sys.stdout.write(CLR)
     
     print(f"{BLD}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{RST}")
@@ -122,7 +123,7 @@ def render_ui(mode, lux, accel, touch, countdown):
     print(f"{BLD}┃{RST}{banner_str}{BLD}┃{RST}")
     print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
     
-    l_bar = draw_bar(lux, 200, BCYN, 25) # Max 200 lux for visual scale
+    l_bar = draw_bar(lux, 150, BCYN, 25) # Max 150 lux for visual scale
     raw_lux = f"{lux:.1f}lx"
     left_side_lux = f" {BLD}LUX LEVEL:{RST} {raw_lux:>8}  {l_bar}"
     print(f"{BLD}┃{RST}{left_side_lux}{' ' * 11}{BLD}┃{RST}")
@@ -144,6 +145,14 @@ def render_ui(mode, lux, accel, touch, countdown):
     left_side_c = f" {BLD}COUNTDOWN:   {RST} {c_col}{c_text}{RST}"
     pad_c = 58 - (1 + 13 + 1 + len(c_text))
     print(f"{BLD}┃{RST}{left_side_c}{' ' * pad_c}{BLD}┃{RST}")
+
+    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    print(f"{BLD}┃{RST}{BLD}{BWHT} EVENT LOG:                                               {RST}{BLD}┃{RST}")
+    for i in range(3):
+        log_str = event_log[i] if i < len(event_log) else ""
+        pad_log = max(0, 58 - (len(log_str) + 1))
+        # Ensure log_str string length is purely visible characters
+        print(f"{BLD}┃{RST} {DIM}{log_str}{RST}{' ' * pad_log}{BLD}┃{RST}")
     
     print(f"{BLD}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{RST}")
     sys.stdout.flush()
@@ -154,8 +163,18 @@ def main():
     
     # State Engine Variables
     mode = "NORMAL"
+    last_mode = "NORMAL"
     warn_start = 0
     countdown = 5.0
+    
+    event_log = []
+    def log_event(msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        event_log.append(f"[{timestamp}] {msg}")
+        if len(event_log) > 3:
+            event_log.pop(0)
+            
+    log_event("System Initialized")
     
     try:
         while True:
@@ -191,6 +210,20 @@ def main():
                 if countdown == 0:
                     mode = "ALARM"
                     
+            # --- Status Transitions ---
+            if mode != last_mode:
+                if mode == "INTENTIONAL_OFF":
+                    log_event("Mute Activated")
+                elif mode == "FALL_ALARM":
+                    log_event("Impact Detected (> 3g)")
+                elif mode == "ALARM":
+                    log_event("REMOVED: Siren Engaged")
+                elif mode == "REMOVAL_WARN":
+                    log_event("Warning: Helmet Removal Detected")
+                elif mode == "NORMAL":
+                    log_event("System Re-Armed")
+                last_mode = mode
+                    
             # --- Hardware Drive ---
             if buzzer is not None and led_red is not None:
                 if mode in ["ALARM", "FALL_ALARM"]:
@@ -204,7 +237,7 @@ def main():
                     buzzer.off()
                     
             # Render to screen
-            render_ui(mode, lux, accel, touch, countdown)
+            render_ui(mode, lux, accel, touch, countdown, event_log)
             time.sleep(0.1)
             
     except KeyboardInterrupt:
