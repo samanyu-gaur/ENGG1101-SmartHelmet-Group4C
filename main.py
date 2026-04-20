@@ -1,7 +1,7 @@
 import time
 import math
 import os
-from smbus2 import SMBus
+from smbus2 import SMBus, i2c_msg
 from gpiozero import PWMOutputDevice, LED, Button
 
 # --- Configuration ---
@@ -53,9 +53,15 @@ current_accel = 1.0
 def get_data():
     global current_lux, current_accel
     try:
-        # Read Lux
-        l_data = bus.read_i2c_block_data(ADDR_BH, 0x10, 2)
+        # Read Lux (BH1750 uses raw reads, not block reads with register addresses)
+        read_msg = i2c_msg.read(ADDR_BH, 2)
+        bus.i2c_rdwr(read_msg)
+        l_data = list(read_msg)
         current_lux = ((l_data[0] << 8) | l_data[1]) / 1.2
+        
+        if current_lux == 0.0:
+            bus.write_byte(ADDR_BH, 0x01) # Power On (Recovery)
+            bus.write_byte(ADDR_BH, 0x10) # Continuous H-Res Mode
         
         # Read Accel
         a_data = bus.read_i2c_block_data(ADDR_MPU, 0x3B, 6)
