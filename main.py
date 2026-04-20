@@ -1,12 +1,9 @@
 import time
 import math
-import threading
+import sys
 from datetime import datetime
 from smbus2 import SMBus, i2c_msg
 from gpiozero import PWMOutputDevice, LED, Button
-from flask import Flask, render_template_string, jsonify
-
-app = Flask(__name__)
 
 # --- Configuration ---
 I2C_BUS = 1
@@ -17,67 +14,61 @@ PIN_BUZZER = 12
 PIN_LED_RED = 27
 PIN_TOUCH = 24
 
-THRESH_LUX = 50    # REQUIREMENT: Lux > 50 for removal
-THRESH_FALL = 3.0   # REQUIREMENT: G-Force > 3.0g
+THRESH_LUX = 50
+THRESH_FALL = 3.0
 DELAY_REMOVAL = 5.0
 
-# --- Global State ---
+# --- ANSI UI Constants ---
+CLR = "\033[H\033[J"
+RST = "\033[0m"
+BLD = "\033[1m"
+DIM = "\033[2m"
+INV = "\033[7m"
+BLINK = "\033[5m"
+
+BRED = "\033[91m"
+BGRN = "\033[92m"
+BYLW = "\033[93m"
+BBLU = "\033[94m"
+BMAG = "\033[95m"
+BCYN = "\033[96m"
+
+# --- Globals and Hardware Init ---
 try:
     bus = SMBus(I2C_BUS)
 except:
     bus = None
 
-state = {
-    "lux": 0.0,
-    "accel": 1.0,
-    "alarm": False,
-    "warning": False,
-    "warning_start": None,
-    "status": "MONITORING",
-    "countdown": 5.0,
-    "touch_active": False
-}
-
-state_lock = threading.Lock()
-
-# --- Hardware Setup ---
 def init_hw():
-    if bus is None:
-        return False
-    try:
-        # BH1750 Wakeup
-        bus.write_byte(ADDR_BH, 0x01) # Power On
-        bus.write_byte(ADDR_BH, 0x07) # Reset
-        time.sleep(0.1)
-        bus.write_byte(ADDR_BH, 0x10) # Continuous H-Res Mode
-        
-        # MPU6050 Wakeup
-        bus.write_byte_data(ADDR_MPU, 0x6B, 0x00)
-        return True
-    except:
-        return False
+    if bus:
+        try:
+            # Wake up BH1750
+            bus.write_byte(ADDR_BH, 0x01)
+            bus.write_byte(ADDR_BH, 0x07)
+            time.sleep(0.1)
+            bus.write_byte(ADDR_BH, 0x10)
+            # Wake up MPU6050
+            bus.write_byte_data(ADDR_MPU, 0x6B, 0x00)
+            return True
+        except:
+            return False
+    return False
 
-# Initialize GPIO with error handling (if run on non-pi)
 try:
     buzzer = PWMOutputDevice(PIN_BUZZER)
     led_red = LED(PIN_LED_RED)
     touch_sensor = Button(PIN_TOUCH, pull_up=False)
 except:
-    buzzer = None
-    led_red = None
-    touch_sensor = None
+    buzzer, led_red, touch_sensor = None, None, None
 
 def get_sensors():
-    if bus is None:
-        return state["lux"], state["accel"]
+    if bus is None: return 0.0, 1.0
     try:
-        # BH1750 Lux
         msg = i2c_msg.read(ADDR_BH, 2)
         bus.i2c_rdwr(msg)
         l_data = list(msg)
         lux = ((l_data[0] << 8) | l_data[1]) / 1.2
         
-        # MPU6050 Accel
         a_data = bus.read_i2c_block_data(ADDR_MPU, 0x3B, 6)
         def rw(h, l):
             v = (h << 8) | l
@@ -86,240 +77,141 @@ def get_sensors():
         ay = rw(a_data[2], a_data[3]) / 16384.0
         az = rw(a_data[4], a_data[5]) / 16384.0
         accel = math.sqrt(ax**2 + ay**2 + az**2)
-        
         return lux, accel
-    except Exception as e:
-        return state["lux"], state["accel"]
+    except:
+        return 0.0, 1.0
 
-def hardware_loop():
-    init_hw()
-    while True:
-        lux, accel = get_sensors()
-        touch = touch_sensor.is_pressed if touch_sensor else False
-        now = time.time()
+# --- Display Utilities ---
+def draw_bar(val, max_val, color, width=25):
+    val = max(0, min(val, max_val))
+    filled = int((val / max_val) * width)
+    unfilled = width - filled
+    return f"{color}{'█' * filled}{RST}{DIM}{'░' * unfilled}{RST}"
+
+def pad_banner(text, width=58):
+    pad_l = (width - len(text)) // 2
+    pad_r = width - len(text) - pad_l
+    return " " * pad_l, " " * pad_r
+
+def render_ui(mode, lux, accel, touch, countdown):
+    sys.stdout.write(CLR)
+    
+    print(f"{BLD}┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓{RST}")
+    
+    title_text = "SMART HELMET TERMINAL HUD"
+    p_l, p_r = pad_banner(title_text)
+    print(f"{BLD}┃{RST}{p_l}{BLD}{BCYN}{title_text}{RST}{p_r}{BLD}┃{RST}")
+    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    
+    if mode == "NORMAL":
+        p_l, p_r = pad_banner("[  SYSTEM ARMED  ]")
+        banner_str = f"{p_l}{BGRN}[  SYSTEM ARMED  ]{RST}{p_r}"
+    elif mode == "REMOVAL_WARN":
+        p_l, p_r = pad_banner("[  REMOVAL WARNING  ]")
+        banner_str = f"{p_l}{BYLW}{BLINK}[  REMOVAL WARNING  ]{RST}{p_r}"
+    elif mode == "INTENTIONAL_OFF":
+        p_l, p_r = pad_banner("[  INTENTIONAL OFF  ]")
+        banner_str = f"{p_l}{BBLU}{DIM}[  INTENTIONAL OFF  ]{RST}{p_r}"
+    elif mode == "ALARM":
+        p_l, p_r = pad_banner("[  !!! HELMET REMOVED !!!  ]")
+        banner_str = f"{p_l}{BRED}{INV}[  !!! HELMET REMOVED !!!  ]{RST}{p_r}"
+    elif mode == "FALL_ALARM":
+        p_l, p_r = pad_banner("[  !!! FALL DETECTED !!!  ]")
+        banner_str = f"{p_l}{BRED}{INV}[  !!! FALL DETECTED !!!  ]{RST}{p_r}"
         
-        with state_lock:
-            state["lux"] = lux
-            state["accel"] = accel
-            state["touch_active"] = touch
+    print(f"{BLD}┃{RST}{banner_str}{BLD}┃{RST}")
+    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    
+    l_bar = draw_bar(lux, 200, BCYN, 25) # Max 200 lux for visual scale
+    raw_lux = f"{lux:.1f}lx"
+    left_side_lux = f" {BLD}LUX LEVEL:{RST} {raw_lux:>8}  {l_bar}"
+    print(f"{BLD}┃{RST}{left_side_lux}{' ' * 11}{BLD}┃{RST}")
+    
+    a_bar = draw_bar(accel, 5.0, BMAG, 25) # Max 5g for visual scale
+    raw_accel = f"{accel:.2f}g"
+    left_side_accel = f" {BLD}G-FORCE:  {RST} {raw_accel:>8}  {a_bar}"
+    print(f"{BLD}┃{RST}{left_side_accel}{' ' * 11}{BLD}┃{RST}")
+    print(f"{BLD}┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫{RST}")
+    
+    t_text = "PRESSED" if touch else "RELEASED"
+    t_col = BGRN if touch else DIM
+    left_side_t = f" {BLD}TOUCH SENSOR:{RST} {t_col}{t_text}{RST}"
+    pad_t = 58 - (1 + 13 + 1 + len(t_text))
+    print(f"{BLD}┃{RST}{left_side_t}{' ' * pad_t}{BLD}┃{RST}")
+    
+    c_text = f"{countdown:.1f}s" if mode == "REMOVAL_WARN" else "---"
+    c_col = BYLW if mode == "REMOVAL_WARN" else DIM
+    left_side_c = f" {BLD}COUNTDOWN:   {RST} {c_col}{c_text}{RST}"
+    pad_c = 58 - (1 + 13 + 1 + len(c_text))
+    print(f"{BLD}┃{RST}{left_side_c}{' ' * pad_c}{BLD}┃{RST}")
+    
+    print(f"{BLD}┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛{RST}")
+    sys.stdout.flush()
 
-            # 1. Reset / Neutral Conditions
-            if lux < THRESH_LUX or touch:
-                state["warning"] = False
-                state["warning_start"] = None
-                state["countdown"] = 5.0
-                if touch: # Manual silence
-                    state["alarm"] = False
-                    state["status"] = "MONITORING"
 
-            # 2. Alarm Escalation
-            if not state["alarm"]:
-                # Immediate Fall Alarm
-                if accel > THRESH_FALL:
-                    state["alarm"] = True
-                    state["status"] = "ALARM: CRITICAL FALL"
+def main():
+    init_hw()
+    
+    # State Engine Variables
+    mode = "NORMAL"
+    warn_start = 0
+    countdown = 5.0
+    
+    try:
+        while True:
+            now = time.time()
+            lux, accel = get_sensors()
+            touch = touch_sensor.is_pressed if touch_sensor else False
+            
+            # --- Logic Rules ---
+            
+            # 1. Fall Detection Overrides (Immediate bypass)
+            if accel > THRESH_FALL:
+                mode = "FALL_ALARM"
+
+            # 2. Touch Mute logic
+            if touch:
+                if mode in ["REMOVAL_WARN", "ALARM", "FALL_ALARM"]:
+                    mode = "INTENTIONAL_OFF"
+                    
+            # 3. Rearm Logic (Auto-recover if helmet worn)
+            if lux <= THRESH_LUX:
+                if mode in ["INTENTIONAL_OFF", "REMOVAL_WARN", "ALARM"]:
+                    mode = "NORMAL"
+                    countdown = 5.0
+                    
+            # 4. Removal Warnings
+            if mode == "NORMAL" and lux > THRESH_LUX:
+                mode = "REMOVAL_WARN"
+                warn_start = now
                 
-                # Removal Alarm (5s Countdown)
-                elif lux > THRESH_LUX:
-                    if not state["warning"]:
-                        state["warning"] = True
-                        state["warning_start"] = now
-                        state["status"] = "WARNING: REMOVAL"
+            if mode == "REMOVAL_WARN":
+                elapsed = now - warn_start
+                countdown = max(0, DELAY_REMOVAL - elapsed)
+                if countdown == 0:
+                    mode = "ALARM"
                     
-                    elapsed = now - state["warning_start"]
-                    state["countdown"] = max(0, DELAY_REMOVAL - elapsed)
-                    
-                    if elapsed > DELAY_REMOVAL:
-                        if not touch: # Trigger if not cleared
-                            state["alarm"] = True
-                            state["status"] = "ALARM: HELMET DISCARDED"
-
-            # 3. Hardware Drive
+            # --- Hardware Drive ---
             if buzzer is not None and led_red is not None:
-                if state["alarm"]:
+                if mode in ["ALARM", "FALL_ALARM"]:
                     led_red.on()
                     buzzer.value = 0.5 if int(now * 8) % 2 else 0
-                elif state["lux"] > THRESH_LUX:
+                elif mode == "REMOVAL_WARN":
                     led_red.value = int(now * 4) % 2
                     buzzer.off()
-                else:
+                else: # INTENTIONAL_OFF or NORMAL
                     led_red.off()
                     buzzer.off()
-        time.sleep(0.1)
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smart Helmet HUD</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body {
-            background-color: #0b0c10;
-            color: #66fcf1;
-            font-family: 'Courier New', Courier, monospace;
-            text-align: center;
-            margin: 0;
-            padding: 20px;
-        }
-        h1 {
-            color: #45a29e;
-            text-shadow: 0 0 10px #45a29e;
-        }
-        .container {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 20px;
-        }
-        .dashboard-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            width: 90%;
-            max-width: 800px;
-        }
-        .card {
-            background: #1f2833;
-            padding: 20px;
-            border-radius: 10px;
-            border: 1px solid #45a29e;
-            box-shadow: 0 0 15px #45a29e55;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-        }
-        .timer {
-            font-size: 4em;
-            font-weight: bold;
-            color: #fceea7;
-            text-shadow: 0 0 20px #fceea7;
-        }
-        .alert {
-            color: #ff3b3f !important;
-            text-shadow: 0 0 20px #ff3b3f !important;
-        }
-        canvas {
-            background: #1f2833;
-            border-radius: 10px;
-        }
-        .status-box {
-            font-size: 1.5em;
-            font-weight: bold;
-            margin-top: 10px;
-            text-transform: uppercase;
-        }
-    </style>
-</head>
-<body>
-    <h1>SMART HELMET HUD</h1>
-    <div class="container">
-        <div class="dashboard-grid">
-            <div class="card">
-                <h2>G-Force Matrix</h2>
-                <div style="font-size: 2em; margin-bottom: 10px;" id="accelVal">1.00 g</div>
-                <div style="height:200px; width:100%;">
-                    <canvas id="gforceChart"></canvas>
-                </div>
-            </div>
-            <div class="card">
-                <h2>System Status</h2>
-                <div class="timer" id="countdownTimer">5.0</div>
-                <div class="status-box" id="systemStatus">MONITORING</div>
-                <h3 style="margin-top: 20px;">Lux Level: <span id="luxVal">0.0</span></h3>
-                <h3>Touch Sensor: <span id="touchVal">INACTIVE</span></h3>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const ctx = document.getElementById('gforceChart').getContext('2d');
-        const gforceChart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: Array(20).fill(''),
-                datasets: [{
-                    label: 'G-Force (g)',
-                    data: Array(20).fill(1),
-                    borderColor: '#66fcf1',
-                    backgroundColor: 'rgba(102, 252, 241, 0.2)',
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.4,
-                    pointRadius: 0
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    y: { min: 0, max: 10, ticks: { color: '#c5c6c7' }, grid: { color: '#45a29e55' } },
-                    x: { ticks: { display: false }, grid: { display: false } }
-                },
-                plugins: {
-                    legend: { display: false }
-                },
-                animation: false
-            }
-        });
-
-        setInterval(() => {
-            fetch('/data')
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('accelVal').innerText = data.accel.toFixed(2) + ' g';
-                    document.getElementById('luxVal').innerText = data.lux.toFixed(1);
-                    document.getElementById('touchVal').innerText = data.touch_active ? 'ACTIVE' : 'INACTIVE';
                     
-                    const timerEl = document.getElementById('countdownTimer');
-                    timerEl.innerText = data.countdown.toFixed(1);
-                    
-                    const statusEl = document.getElementById('systemStatus');
-                    statusEl.innerText = data.status;
-                    
-                    if (data.alarm) {
-                        timerEl.classList.add('alert');
-                        statusEl.classList.add('alert');
-                    } else if (data.warning) {
-                        timerEl.style.color = '#ffaa00';
-                        statusEl.style.color = '#ffaa00';
-                        timerEl.classList.remove('alert');
-                        statusEl.classList.remove('alert');
-                    } else {
-                        timerEl.style.color = '#fceea7';
-                        statusEl.style.color = '#66fcf1';
-                        timerEl.classList.remove('alert');
-                        statusEl.classList.remove('alert');
-                    }
+            # Render to screen
+            render_ui(mode, lux, accel, touch, countdown)
+            time.sleep(0.1)
+            
+    except KeyboardInterrupt:
+        if led_red: led_red.off()
+        if buzzer: buzzer.off()
+        print(CLR)
+        print(f"{BGRN}System Shutdown Cleanly.{RST}")
 
-                    const chartData = gforceChart.data.datasets[0].data;
-                    chartData.push(data.accel);
-                    chartData.shift();
-                    gforceChart.update();
-                })
-                .catch(err => console.error(err));
-        }, 200);
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def dashboard():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/data')
-def get_data():
-    with state_lock:
-        return jsonify(state)
-
-if __name__ == '__main__':
-    # Start the hardware background thread
-    hw_thread = threading.Thread(target=hardware_loop, daemon=True)
-    hw_thread.start()
-    
-    # Run the Flask app on 0.0.0.0
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+    main()
